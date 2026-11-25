@@ -61,6 +61,13 @@ jobs:
         run: bash scripts/room.sh clean
       - name: The game's build
         run: bash scripts/store_base.sh
+      - name: Upload ELF mismatch diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-elf-comparison
+          path: ${{ runner.temp }}/elf-comparison.json
+          if-no-files-found: ignore
       - uses: actions/cache/save@v4
         with:
           # store2: built in the sandbox's environment (store_base.sh); a cache's key can't be written twice.
