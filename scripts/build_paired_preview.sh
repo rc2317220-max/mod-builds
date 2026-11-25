@@ -40,7 +40,7 @@ python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --no-bu
 apk="$source/target/android/starling-dev-0.9.0-arm64-v8a.apk"
 test -s "$apk"
 "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$apk"
-"$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk" | grep -m1 "package: name='io.github.juanluci.starling.dev'"
+"$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$apk" | grep "package: name='io.github.juanluci.starling.dev'"
 cp "$apk" "$RUNNER_TEMP/RustPG-Sunrise-Preview4-arm64.apk"
 sha256sum "$RUNNER_TEMP/RustPG-Sunrise-Preview4-arm64.apk"
 # Every shipped Rust dependency is copied from the paired APK only after comparing
