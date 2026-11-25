@@ -95,7 +95,11 @@ jobs:
           TURBO_CACHE_HIT: ${{ steps.turbo.outputs.cache-hit }}
         run: |
           echo "Verified Turbo cache: $TURBO_CACHE_HIT"
-          bash scripts/preview4_whole_sandbox.sh mods.bin result
+          if [ "$TURBO_CACHE_HIT" = true ]; then
+            bash scripts/preview4_whole_sandbox.sh mods.bin result
+          else
+            bash scripts/preview4_legacy_sandbox.sh mods.bin result
+          fi
           if [ -f result/compile-metrics.json ]; then cat result/compile-metrics.json; fi
       - uses: actions/upload-artifact@v4
         with:
