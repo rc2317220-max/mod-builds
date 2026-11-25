@@ -51,8 +51,12 @@ jobs:
       # installs its tools first too).
       - name: The Android tools
         run: |
+          ndk=28.2.13676358
+          if [ "$BUILD" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$ABI" = arm64-v8a ]; then
+            ndk=27.3.13750724
+          fi
           (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
-            --install "ndk;28.2.13676358" "build-tools;35.0.0" "platforms;android-36" | tail -3
+            --install "ndk;$ndk" "build-tools;35.0.0" "platforms;android-36" | tail -3
       - name: Make room
         run: bash scripts/room.sh clean
       - name: The game's build
