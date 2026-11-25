@@ -39,7 +39,7 @@ class GitHub {
     const method = init.method ?? "GET";
     const json = (code, body) => new Response(JSON.stringify(body), { status: code });
     if (url.href === `https://raw.githubusercontent.com/${this.repo}/main/versions.json`) {
-      return json(200, { "0.8.0": COMMIT });
+      return json(200, { "0.8.0": COMMIT, "0.9.0-preview.cac7bf6459": "cac7bf64590fb38b4badee90f1f09848ce7f8daa" });
     }
     const download = url.href.match(new RegExp(`^https://github.com/${this.repo}/releases/download/([\\w-]+)/(.+)$`));
     if (download) {
@@ -596,4 +596,17 @@ test("the v1 answer names the repository the game waits in, a fork's too", async
   github.repo = "sayo/mod-builds";
   const told = await (await call("POST", "/v1/build?version=0.8.0", { body: mods, as: fork })).json();
   assert.deepEqual(told, { job: await jobOf("0.8.0", COMMIT, mods), repo: "sayo/mod-builds" });
+});
+
+test("original Preview 4 custom server uses exact v1 build version", async () => {
+  const version = "0.9.0-preview.cac7bf6459";
+  const response = await call("POST", "/v1/build?version=" + version, {
+    body: new TextEncoder().encode("preview native request"),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(github.dispatched.at(-1).inputs.version, version);
+  const wrong = await call("POST", "/v1/build?version=0.9.0-preview.0000000000", {
+    body: new TextEncoder().encode("preview native request"),
+  });
+  assert.equal(wrong.status, 400);
 });
