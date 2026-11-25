@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.event_name == 'workflow_dispatch' && inputs.prepare_base
+    if: github.event_name == 'push' || inputs.prepare_base
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -43,7 +43,7 @@ jobs:
             -f abi=arm64-v8a -f profile=fast -f nightly=v0.9.0 \
             -f apk=https://github.com/starling-client/starling/releases/download/v0.9.0/starling-0.9.0-arm64-v8a.apk
   deploy:
-    if: github.event_name == 'push' || inputs.deploy_worker
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_worker
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.COMPILE }}
