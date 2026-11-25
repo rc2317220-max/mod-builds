@@ -1,0 +1,47 @@
+name: Compiler gateway recovery
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/compiler-gateway-recovery.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Dispatch confirmed"
+  recover:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BUILD_REPO_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.COMPILE }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test gateway permissions
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml" --jq '{name,state}'
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/compiler-gateway-recovery.yml/dispatches" -f ref=main >/dev/null
+      - name: Resolve Cloudflare account
+        run: |
+          set -euo pipefail
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            account=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" 'https://api.cloudflare.com/client/v4/accounts?per_page=50' | jq -er 'select(.success and (.result | length) == 1) | .result[0].id')
+            echo "::add-mask::$account"
+            echo "CLOUDFLARE_ACCOUNT_ID=$account" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Refresh gateway using verified token
+        working-directory: worker
+        run: |
+          npm ci
+          npm test
+          npx wrangler deploy
+          printf '%s' "$GH_TOKEN" | npx wrangler secret put GITHUB_TOKEN
