@@ -40,7 +40,7 @@ if [ "$BUILD" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$ABI" = arm64
   source_path="$HOME/work/starling/starling"
   mkdir -p "$source_path"
   sudo mount --bind "$root/source" "$source_path"
-  trap 'sudo umount "$source_path"' EXIT
+  trap 'cd /; sudo umount "$source_path"' EXIT
 fi
 cd "$source_path"
 # The Rust the game pins (tools/ci/rust-version), with the std's source build_apk.py builds the std from.
