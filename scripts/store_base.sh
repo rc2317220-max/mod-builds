@@ -32,7 +32,17 @@ if [ ! -d "$HOME/android/ndk/$NDK" ]; then
 fi
 export ANDROID_HOME=$HOME/android ANDROID_NDK_HOME=$HOME/android/ndk/$NDK
 
-cd "$root/source"
+# Match the canonical checkout path of the official release; Rust dylib metadata
+# can encode source paths. Keep physical files under the existing cache root.
+repo_scripts=$(realpath "$(dirname "$0")")
+source_path="$root/source"
+if [ "$BUILD" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$ABI" = arm64-v8a ]; then
+  source_path="$HOME/work/starling/starling"
+  mkdir -p "$source_path"
+  sudo mount --bind "$root/source" "$source_path"
+  trap 'sudo umount "$source_path"' EXIT
+fi
+cd "$source_path"
 # The Rust the game pins (tools/ci/rust-version), with the std's source build_apk.py builds the std from.
 rm -rf "$HOME/.rustup" "$HOME/.cargo"
 curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
@@ -104,7 +114,11 @@ if [ -n "${APK:-}" ]; then
       echo "::error::$name differs from the APK's: a mod built here would not load on the phone"; differ=1
     fi
   done
-  [ "$differ" = 0 ] || exit 1
+  if [ "$differ" != 0 ]; then
+    python3 "$repo_scripts/compare_release_elf.py" "$shipped" "$RUNNER_TEMP/apk/lib/$ABI" \
+      "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" "$RUNNER_TEMP/elf-comparison.json" || true
+    exit 1
+  fi
   echo "Every library of the game is the APK's."
 fi
 
