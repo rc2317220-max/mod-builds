@@ -1,0 +1,164 @@
+name: RustPG Original Preview 4 compiler
+run-name: Original Sunrise Preview 4 custom server v1 ARM64 (no APK)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rustpg-preview4-original.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rustpg-preview4-original
+  cancel-in-progress: false
+jobs:
+  base:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python syntax verification
+        run: python3 -m py_compile scripts/preview4_whole_build.py scripts/publish.py
+      - name: Install original Preview 4 ARM64 toolchain
+        run: |
+          set -euo pipefail
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+            --install "ndk;27.3.13750724" "build-tools;35.0.0" "platforms;android-36" | tail -3
+      - name: Make room
+        run: bash scripts/room.sh clean
+      - name: Warm the original whole-game library cache
+        run: bash scripts/preview4_whole_base.sh
+      - name: Generate a real native player rendering probe
+        run: |
+          python3 - <<'PY'
+          import io, pathlib, zipfile
+          out=io.BytesIO()
+          with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
+              z.writestr("sunrise-mod.toml",'''id = "rustpg_preview4_probe"
+          name = "RustPG Preview 4 Probe"
+          version = "0.1.0"
+          api = "0.2"
+          side = "client"
+          [native]
+          game = "26.3"
+          sunrise = "cac7bf64590fb38b4badee90f1f09848ce7f8daa"
+          ''')
+              z.writestr("Cargo.toml",'''[package]
+          name = "rustpg-preview4-probe"
+          version = "0.1.0"
+          edition = "2024"
+          [dependencies]
+          sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
+          ''')
+              z.writestr("src/lib.rs",'''use mod_api::{Hooks, ClientHost, RenderPlayerPostEvent};
+          #[derive(Default)]
+          struct Probe;
+          #[mod_api::sunrise_mod]
+          impl Hooks for Probe {
+              fn render_player_post(&self, _: &dyn ClientHost, event: &mut RenderPlayerPostEvent<'_>) {
+                  if event.who.local {
+                      let _ = event.player.age;
+                      if let Some(model) = event.model {
+                          let _ = model.part("head");
+                      }
+                      event.draw.quad("block/white_concrete", [[-0.1,2.1,0.0],[-0.1,2.0,0.0],[0.1,2.0,0.0],[0.1,2.1,0.0]], [0.0,0.0,16.0,16.0], 0x111111);
+                  }
+              }
+          }
+          ''')
+          raw=out.getvalue()
+          pathlib.Path("probe.smod").write_bytes(raw)
+          pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
+          PY
+      - name: Compile probe through the same offline v1 route as the phone
+        run: bash scripts/preview4_whole_sandbox.sh probe.bin result
+      - name: Verify compiled original-client result
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib,struct
+          p=pathlib.Path("result")
+          r=json.loads((p/"status.json").read_text())
+          print(json.dumps(r,indent=2))
+          assert r["state"]=="done",r
+          so=p/"libsunrise_android.so"
+          with so.open("rb") as f:
+              hdr=f.read(64)
+              f.seek(0)
+              assert hashlib.file_digest(f,"sha256").hexdigest()==r["sha256"]
+          assert hdr[:6]==b"\x7fELF\x02\x01" and struct.unpack_from("<HH",hdr,16)==(3,183)
+          assert r["build"]["abi"]=="arm64-v8a"
+          assert r["build"]["version"]=="0.9.0-preview.cac7bf6459"
+          assert r["build"]["mods"]==[{"id":"rustpg_preview4_probe","version":"0.1.0"}]
+          PY
+      - name: Preserve probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-preview4-v1-probe
+          path: |
+            probe.smod
+            result/status.json
+            result/libsunrise_android.so
+          if-no-files-found: ignore
+      - name: Save verified static compiler base
+        uses: actions/cache/save@v4
+        with:
+          key: preview4-v1-static-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-v1
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+  enable:
+    needs: base
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.COMPILE }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      BUILD_REPO_TOKEN: ${{ secrets.BUILD_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Worker regression tests
+        working-directory: worker
+        run: npm ci && npm test
+      - name: Register only the verified original Preview 4
+        run: |
+          set -euo pipefail
+          test "$GH_REPO" = rc2317220-max/mod-builds
+          gh api "repos/$GH_REPO/contents/versions.json?ref=main" > "$RUNNER_TEMP/versions-meta.json"
+          sha=$(jq -er .sha "$RUNNER_TEMP/versions-meta.json")
+          jq -r .content "$RUNNER_TEMP/versions-meta.json" | base64 -d > "$RUNNER_TEMP/versions-old.json"
+          jq '. + {"0.9.0-preview.cac7bf6459":"cac7bf64590fb38b4badee90f1f09848ce7f8daa"}' "$RUNNER_TEMP/versions-old.json" > "$RUNNER_TEMP/versions-new.json"
+          content=$(base64 -w0 "$RUNNER_TEMP/versions-new.json")
+          gh api --method PUT "repos/$GH_REPO/contents/versions.json" -f sha="$sha" -f content="$content" -f branch=main -f message="Register verified original Preview 4 v1 compiler" >/dev/null
+      - name: Identify configured Cloudflare account
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$BUILD_REPO_TOKEN"
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            account=$(curl -fsS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" 'https://api.cloudflare.com/client/v4/accounts?per_page=50' | jq -er 'select(.success == true and (.result | length) == 1 and ((.result_info.total_count // 1) == 1)) | .result[0].id')
+            [[ "$account" =~ ^[0-9a-f]{32}$ ]]
+            echo "::add-mask::$account"
+            echo "CLOUDFLARE_ACCOUNT_ID=$account" >> "$GITHUB_ENV"
+          fi
+      - name: Deploy original-client v1 route to the existing server
+        working-directory: worker
+        run: |
+          set -euo pipefail
+          npx wrangler deploy
+          printf '%s' "$BUILD_REPO_TOKEN" | npx wrangler secret put GITHUB_TOKEN
+          echo "Original Preview 4 custom server: https://rustpg-compile.rustpg-rc2317220.workers.dev" >> "$GITHUB_STEP_SUMMARY"
