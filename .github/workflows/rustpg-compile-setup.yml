@@ -1,4 +1,5 @@
 name: RustPG Compile server setup
+# Require the official APK dependency-closure gate and sandboxed native mod probe.
 # Retry release base with original host identity inputs and byte-level ELF diagnostics.
 on:
   push:
