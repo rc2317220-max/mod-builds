@@ -555,8 +555,11 @@ async function github(env, method, path, payload) {
     headers: { ...(await headers(env)), ...(payload ? { "Content-Type": "application/json" } : {}) },
     body: payload ? JSON.stringify(payload) : undefined,
   });
-  if (!response.ok) throw new Error(`${method} ${path}: ${response.status} ${await response.text()}`);
-  const text = await response.text();
+  if (!response.ok) throw new Error(`${method} ${path}: ${response.status}`);
+  // Dispatch returns 204 on the pinned API, or 200 on newer GitHub versions.
+  // Its response body is not needed; don't turn a successful dispatch into a 503.
+  if (method === "POST" && path.endsWith("/dispatches")) return null;
+  const text = (await response.text()).trim();
   return text ? JSON.parse(text) : null;
 }
 
