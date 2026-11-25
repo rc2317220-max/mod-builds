@@ -1,17 +1,7 @@
-# Starling's Compile service (src/index.js). Deploy from this folder:
-#   npx wrangler login
-#   npx wrangler deploy
-#   echo <the App's id>| npx wrangler secret put GITHUB_APP_ID
-#   openssl pkcs8 -topk8 -nocrypt -in <the App's .pem> | npx wrangler secret put GITHUB_APP_KEY
-# The GitHub App is installed on mod-builds alone, with Actions and Contents to write: its token has
-# its own hourly limit and the runs are the App's. (GITHUB_TOKEN, a person's token, still works in
-# its place, but shares that person's limit and mails them every run that fails.)
-# Then packaging/android/build-server.txt in starling-client/starling (branch starling) says the
-# address wrangler printed, and every Starling since 0.8.0 compiles here.
-# A fork's own service names its repository here (README.md, "Your own build service"):
-# [vars]
-# REPO = "you/mod-builds"
-name = "starling-compile"
+name = "rustpg-compile"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 workers_dev = true
+
+[vars]
+REPO = "rc2317220-max/mod-builds"
