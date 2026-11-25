@@ -33,12 +33,15 @@ def symbols(nm, path, defined):
     flag = "--defined-only" if defined else "--undefined-only"
     return {s.strip().split("@")[0] for s in run(nm, "-D", flag, "--format=just-symbols", path).splitlines() if s.strip()}
 
-def verify(source, library, profile, reference):
+def verify(source, library, profile, reference, paired=False):
     ndk = pathlib.Path(os.environ["ANDROID_NDK_HOME"])
     binpath = ndk / "toolchains/llvm/prebuilt/linux-x86_64/bin"
     readelf, strip, nm = (binpath / n for n in ("llvm-readelf", "llvm-strip", "llvm-nm"))
-    if not reference.is_dir() or not LIBS <= {p.name for p in reference.glob("*.so")}:
-        raise ValueError("official APK reference is missing or incomplete")
+    libs = {p.name for p in reference.glob("*.so")} if paired else LIBS
+    host = "libsunrise_mod_host.so" if paired else HOST
+    required = {host, "libsunrise_android.so", "libemutls.so", "libmod_vocab.so"} if paired else LIBS
+    if not reference.is_dir() or not required <= {p.name for p in reference.glob("*.so")}:
+        raise ValueError("APK reference is missing or incomplete")
     header = run(readelf, "-h", library)
     if not re.search(r"Machine:\s+AArch64", header):
         raise ValueError("mod is not AArch64 ELF")
@@ -58,14 +61,14 @@ def verify(source, library, profile, reference):
             if name in visited:
                 continue
             visited.add(name)
-            if name in LIBS:
+            if name in libs:
                 actual = next((d/name for d in dirs if (d/name).is_file()), None)
                 if actual is None:
                     raise ValueError(f"linked game library not found: {name}")
                 stripped = pathlib.Path(tmp)/name
                 subprocess.run([str(strip), "--strip-unneeded", "-o", str(stripped), str(actual)], check=True)
                 if sha(stripped) != sha(reference/name):
-                    raise ValueError(f"linked game library is not identical to official APK: {name}")
+                    raise ValueError(f"linked game library is not identical to paired APK: {name}")
                 checked.add(name)
                 available.update(symbols(nm, reference/name, True))
                 unresolved.update(symbols(nm, reference/name, False))
@@ -76,11 +79,11 @@ def verify(source, library, profile, reference):
                 raise ValueError(f"unverified dynamic dependency: {name}")
     if "libmod_api.so" not in checked and "libmod_vocab.so" not in checked:
         raise ValueError("no verified Rust mod API dependency")
-    if HOST not in checked:
-        host_only = symbols(nm, reference/HOST, True) - available
+    if host not in checked:
+        host_only = symbols(nm, reference/host, True) - available
         if unresolved & host_only:
             raise ValueError("mod references symbols exclusive to the unverified host")
-    print("Official APK link closure verified: " + ", ".join(sorted(checked)), flush=True)
+    print(("Paired APK" if paired else "Official APK") + " link closure verified: " + ", ".join(sorted(checked)), flush=True)
 
 if __name__ == "__main__":
     verify(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3], pathlib.Path(sys.argv[4]))
