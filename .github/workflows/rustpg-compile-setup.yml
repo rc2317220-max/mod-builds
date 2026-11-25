@@ -1,4 +1,5 @@
 name: RustPG Compile server setup
+# Retry release base with matching checkout path and ELF section diagnostics.
 on:
   push:
     branches: [main]
