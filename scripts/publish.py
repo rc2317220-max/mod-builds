@@ -81,6 +81,7 @@ def publish(result, job, ask, built, gh, out):
         gh("release", "upload", results, str(out / f"{job}.failed.json"), "--clobber")
     gh("release", "delete-asset", "requests", f"{ask}.bin", "-y", check=False)
     print(json.dumps({k: v for k, v in status.items() if k != "build"}))
+    return state
 
 
 def run_gh(*args, check=True):
@@ -88,7 +89,7 @@ def run_gh(*args, check=True):
 
 
 if __name__ == "__main__":
-    publish(
+    state = publish(
         pathlib.Path("result"),
         os.environ["JOB"],
         os.environ["ASK"],
@@ -96,3 +97,8 @@ if __name__ == "__main__":
         run_gh,
         pathlib.Path("answer"),
     )
+
+    # Publish the failed JSON first so Starling receives its error, then mark
+    # the Preview 4 workflow failed rather than reporting a false green build.
+    if os.environ.get("VERSION") == "0.9.0-preview.cac7bf6459" and state != "done":
+        sys.exit("Preview 4 compilation failed; failure status was published for Starling.")
