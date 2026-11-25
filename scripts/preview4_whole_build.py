@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import zipfile
 
@@ -120,26 +121,70 @@ RUNTIME = """
     }
 """
 
-def configure(body):
-    sys.path.insert(0, str(ROOT / "tools"))
-    import android_native_sdk as sdk
+def fixed_once(path, old, new):
+    """Apply a trusted, fixed patch once; refuse an unexpected source layout."""
+    source = path.read_text()
+    if source.count(new) == 1:
+        return
+    replace_once(path, old, new)
+
+
+def prepare_fixed_base():
+    """Prepare the invariant source before warming Cargo's trusted base.
+
+    The base marker keeps the workspace glob valid without registering a mod.
+    The generated registration lives in sunrise-android, not sunrise-client.
+    Request code only writes in the disposable overlay.
+    """
+    if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip() != COMMIT:
+        raise RuntimeError("wrong original Preview 4 checkout")
     folder = ROOT / "rustpg-whole-mods"
-    folder.mkdir(exist_ok=True)
-    replace_once(ROOT/"Cargo.toml", "members = [\n",
-                 'members = [\n    "rustpg-whole-mods/*",\n')
+    marker = folder / "__base_marker"
+    (marker / "src").mkdir(parents=True, exist_ok=True)
+    manifest = '[package]\nname = "rustpg-compiler-base-marker"\nversion = "0.0.0"\nedition = "2024"\npublish = false\n'
+    for path, contents in [(marker / "Cargo.toml", manifest),
+                           (marker / "src/lib.rs", "// Build-cache workspace marker; never linked.\n")]:
+        if not path.exists():
+            path.write_text(contents)
+        elif path.read_text() != contents:
+            raise RuntimeError("unexpected compiler base marker")
+    fixed_once(ROOT/"Cargo.toml", "members = [\n",
+               'members = [\n    "rustpg-whole-mods/*",\n')
     runtime = ROOT/"crates/sunrise-mod-package/src/runtime.rs"
-    replace_once(runtime, "impl Runtime {\n", "impl Runtime {\n" + RUNTIME)
+    fixed_once(runtime, "impl Runtime {\n", "impl Runtime {\n" + RUNTIME)
     android = ROOT/"crates/sunrise-client/src/android_lib.rs"
-    replace_once(android, "use winit::platform::android::activity::AndroidApp;",
-                 "use winit::platform::android::activity::AndroidApp;\nmod rustpg_whole;")
-    replace_once(android, "let (entries, native) = native_libraries();",
-                 """let (entries, native) = match rustpg_whole::load(&startup.launch().context.game_dir) {
+    fixed_once(android, "use winit::platform::android::activity::AndroidApp;",
+               'use winit::platform::android::activity::AndroidApp;\n#[path = "../../sunrise-android/src/rustpg_whole.rs"]\nmod rustpg_whole;')
+    fixed_once(android, "let (entries, native) = native_libraries();",
+               """let (entries, native) = match rustpg_whole::load(&startup.launch().context.game_dir) {
         Ok(loaded) => loaded,
         Err(error) => {
             sunrise_client::android::warn(&error);
             Default::default()
         }
     };""")
+    registry = ROOT/"crates/sunrise-android/src/rustpg_whole.rs"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    if not registry.exists():
+        registry.write_text("""use std::path::Path;
+use mod_platform::ModEntry;
+use sunrise_mod_package::runtime::Runtime;
+pub fn load(_root: &Path) -> Result<(Vec<ModEntry>, Runtime), String> {
+    Ok(super::native_libraries())
+}
+""")
+    # A report only: the optimization profile, codegen flags, target and ABI
+    # stay identical. Do not enable incremental or change symbol identities.
+    fixed_once(ROOT/"packaging/android/build_apk.py",
+               '"build", BUILD_STD, "--profile", profile,',
+               '"build", BUILD_STD, "--profile", profile, "--timings",')
+
+
+def configure(body):
+    prepare_fixed_base()
+    sys.path.insert(0, str(ROOT / "tools"))
+    import android_native_sdk as sdk
+    folder = ROOT / "rustpg-whole-mods"
     cargo_android = ROOT/"crates/sunrise-android/Cargo.toml"
     dependency_lines = []
     entries = []
@@ -202,7 +247,7 @@ pub fn load(root: &Path) -> Result<(Vec<ModEntry>, Runtime), String> {
     Ok((entries, native))
 }
 """
-    (android.parent/"rustpg_whole.rs").write_text(generated)
+    (ROOT/"crates/sunrise-android/src/rustpg_whole.rs").write_text(generated)
     return records
 
 def compile_game(body, out):
@@ -217,7 +262,14 @@ def compile_game(body, out):
     # private folder. A static build must NOT link the APK's Rust dylibs.
     command = [sys.executable, "packaging/android/build_apk.py", "--abi", ABI,
                "--profile", "fast", "--library-only"]
+    started = time.monotonic()
     result = subprocess.run(command, cwd=ROOT, env=env)
+    elapsed = round(time.monotonic() - started, 3)
+    print(f"Cargo build elapsed: {elapsed}s; jobs={env.get('CARGO_BUILD_JOBS', 'default')}", flush=True)
+    report = ROOT/"target/cargo-timings/cargo-timing.html"
+    if report.is_file():
+        shutil.copyfile(report, out/"cargo-timing.html")
+    (out/"compile-metrics.json").write_text(json.dumps({"cargo_seconds":elapsed,"jobs":env.get("CARGO_BUILD_JOBS"),"profile":"fast","returncode":result.returncode}))
     if result.returncode:
         return {"state":"failed","error":"Native source compilation failed; see the GitHub build log.","settled":False}
     made = ROOT/"target/android/libsunrise_android.so"
@@ -241,6 +293,9 @@ def compile_game(body, out):
     return {"state":"done","sha256":digest,"size":size,"build":about}
 
 def main():
+    if sys.argv[1:] == ["--prepare-base"]:
+        prepare_fixed_base()
+        return
     out = Path(sys.argv[2])
     out.mkdir(parents=True,exist_ok=True)
     try:

@@ -6,13 +6,15 @@ body=$(realpath "$1")
 mkdir -p "$2"
 result=$(realpath "$2")
 scripts=$(realpath "$(dirname "$0")")
+source "$scripts/preview4_jobs.sh"
+jobs=$(preview4_jobs)
 layer="$HOME/preview4-v1-layer"
 sudo -n rm -rf "$layer"
 mkdir -p "$layer"
 trap 'sudo -n rm -rf "$layer"' EXIT
 sudo -n timeout --kill-after=10 "${SANDBOX_SECONDS:-3200}" \
   unshare --net --mount --pid --fork --kill-child --propagation private bash -euc '
-home=$1 uid=$2 gid=$3 body=$4 result=$5 scripts=$6 layer=$7
+home=$1 uid=$2 gid=$3 body=$4 result=$5 scripts=$6 layer=$7 jobs=$8
 mount -t proc proc /proc
 mount -t tmpfs -o mode=1777 tmpfs /tmp
 keep=/mnt
@@ -49,6 +51,6 @@ cd /tmp
 exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   --bounding-set=-all --inh-caps=-all \
   env -i HOME="$home" PATH="$home/.cargo/bin:/usr/bin:/bin" CARGO_NET_OFFLINE=true LANG=C.UTF-8 \
-  ANDROID_HOME="$home/android" ANDROID_NDK_HOME="$home/android/ndk/27.3.13750724" CARGO_BUILD_JOBS=3 \
+  ANDROID_HOME="$home/android" ANDROID_NDK_HOME="$home/android/ndk/27.3.13750724" CARGO_BUILD_JOBS="$jobs" \
   python3 -I "$home/scripts/preview4_whole_build.py" "$home/request.bin" "$home/result"
-' sandbox "$HOME" "$(id -u)" "$(id -g)" "$body" "$result" "$scripts" "$layer"
+' sandbox "$HOME" "$(id -u)" "$(id -g)" "$body" "$result" "$scripts" "$layer" "$jobs"
