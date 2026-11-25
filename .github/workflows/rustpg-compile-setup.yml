@@ -1,0 +1,76 @@
+name: RustPG Compile server setup
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rustpg-compile-setup.yml']
+  workflow_dispatch:
+    inputs:
+      prepare_base:
+        description: Prepare exact Starling 0.9.0 ARM64 base
+        type: boolean
+        default: false
+      deploy_worker:
+        description: Deploy Worker using configured secrets
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: rustpg-compile-setup
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.event_name == 'push' || inputs.prepare_base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Create request queue release
+        run: |
+          set -euo pipefail
+          test "$GH_REPO" = rc2317220-max/mod-builds
+          if ! gh release view requests --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create requests --repo "$GH_REPO" --target main --prerelease --title requests --notes 'Compiler request queue'
+          fi
+      - name: Start exact ARM64 base with APK verification
+        run: |
+          gh workflow run store-base.yml --repo "$GH_REPO" --ref main \
+            -f build=ff303502a4f7982551a0e0d3622d9268efe9e829 \
+            -f abi=arm64-v8a -f profile=fast -f nightly=v0.9.0 \
+            -f apk=https://github.com/starling-client/starling/releases/download/v0.9.0/starling-0.9.0-arm64-v8a.apk
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_worker
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      BUILD_REPO_TOKEN: ${{ secrets.BUILD_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify secrets exist and token is scoped to this public fork
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Missing CLOUDFLARE_API_TOKEN"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::Missing CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+          test -n "$BUILD_REPO_TOKEN" || { echo "::error::Missing BUILD_REPO_TOKEN"; exit 1; }
+          test "$GITHUB_REPOSITORY" = rc2317220-max/mod-builds
+          GH_TOKEN="$BUILD_REPO_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq '.private == false and .fork == true' | grep -Fx true
+      - name: Test official Worker
+        working-directory: worker
+        run: npm ci && npm test
+      - name: Deploy official Worker
+        working-directory: worker
+        run: |
+          set -euo pipefail
+          npx wrangler deploy
+          printf '%s' "$BUILD_REPO_TOKEN" | npx wrangler secret put GITHUB_TOKEN
+          echo "Use the HTTPS workers.dev address from the deployment output after store-base has passed." >> "$GITHUB_STEP_SUMMARY"
