@@ -75,7 +75,7 @@ def main():
         for key in diffs:
             diffs[key]["bytes"] = diff_bytes(section_bytes(path,key), section_bytes(official,key))
         ea, eb = exports(str(nm), path), exports(str(nm), official)
-        allocated = [k for k,v in diffs.items() if any(x and x["flags"] & 2 for x in v.values())]
+        allocated = [k for k,v in diffs.items() if any(x and x["flags"] & 2 for x in (v["rebuilt"], v["official"]))]
         result[path.name] = {"identical": False, "rebuilt_size": a["size"], "official_size": b["size"],
                              "rebuilt_sha256": a["sha256"], "official_sha256": b["sha256"],
                              "allocated_differences": allocated, "sections": diffs,
