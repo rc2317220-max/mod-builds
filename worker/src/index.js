@@ -70,7 +70,7 @@ const LOST_SECONDS = 600;
 const DID_NOT_FINISH = "The build on GitHub did not finish. Try again.";
 
 const JOB = /^[0-9a-f]{24}$/;
-const VERSION = /^\d+(\.\d+){1,3}$/;
+const VERSION = /^(?:\d+(\.\d+){1,3}|0\.9\.0-preview\.cac7bf6459)$/;
 // A game build is its commit; a mod's job is its .hmod's hash and the ABI it is built for.
 const BUILD = /^[0-9a-f]{40}$/;
 export const ABIS = ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"];
