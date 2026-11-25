@@ -40,9 +40,18 @@ place android "$home/android"
 layered source "$home/store/source"
 layered cargo "$home/store/cargo"
 place scripts "$scripts"
-if [ "$build" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$abi" = arm64-v8a ]; then
-  test -d "$home/store/source/.release-verified"
-  place verified "$home/store/source/.release-verified"
+reference="$home/store/source/.release-verified"
+paired=0
+if [ -f "$reference/paired-build-id" ]; then
+  test "$(cat "$reference/paired-build-id")" = "$build"
+  test "$abi" = arm64-v8a
+  paired=1
+fi
+has_reference=0
+if [ "$paired" = 1 ] || { [ "$build" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$abi" = arm64-v8a ]; }; then
+  test -d "$reference"
+  place verified "$reference"
+  has_reference=1
 fi
 place mods "$mods"
 place result "$result"
@@ -74,7 +83,7 @@ if [ "$build" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$abi" = arm64
 fi
 back cargo .cargo rw
 back scripts scripts ro
-if [ "$build" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$abi" = arm64-v8a ]; then
+if [ "$has_reference" = 1 ]; then
   back verified release-reference ro
 fi
 back mods mods ro
@@ -88,7 +97,7 @@ exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   --bounding-set=-all --inh-caps=-all \
   env -i HOME="$home" PATH="$home/.cargo/bin:/usr/bin:/bin" CARGO_NET_OFFLINE=true LANG=C.UTF-8 \
   ANDROID_HOME="$sdk_path" ANDROID_NDK_HOME="$sdk_path/ndk/$ndk" CARGO_BUILD_JOBS=3 \
-  BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$source_path" RUSTPG_APK_REFERENCE="$home/release-reference" \
+  BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$source_path" RUSTPG_APK_REFERENCE="$home/release-reference" RUSTPG_PAIRED_APK="$paired" \
   python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/result"
 ' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$result" "$scripts" "$layer" "${BUILD:-}" "${ABI:-}" \
   "${PROFILE:-fast}"
