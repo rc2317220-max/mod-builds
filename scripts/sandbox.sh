@@ -58,10 +58,15 @@ back android android ro
 # inside single quotes.
 back source store/source rw
 source_path="$home/store/source"
+sdk_path="$home/android"
 if [ "$build" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$abi" = arm64-v8a ]; then
   source_path="$home/work/starling/starling"
   mkdir -p "$source_path"
   mount --bind "$home/store/source" "$source_path"
+  sdk_path=/usr/local/lib/android/sdk
+  mkdir -p "$sdk_path"
+  mount --bind "$home/android" "$sdk_path"
+  mount -o remount,bind,ro "$sdk_path"
 fi
 back cargo .cargo rw
 back scripts scripts ro
@@ -75,7 +80,7 @@ cd /tmp
 exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   --bounding-set=-all --inh-caps=-all \
   env -i HOME="$home" PATH="$home/.cargo/bin:/usr/bin:/bin" CARGO_NET_OFFLINE=true LANG=C.UTF-8 \
-  ANDROID_HOME="$home/android" ANDROID_NDK_HOME="$home/android/ndk/$ndk" \
+  ANDROID_HOME="$sdk_path" ANDROID_NDK_HOME="$sdk_path/ndk/$ndk" CARGO_BUILD_JOBS=3 \
   BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$source_path" \
   python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/result"
 ' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$result" "$scripts" "$layer" "${BUILD:-}" "${ABI:-}" \
