@@ -379,7 +379,7 @@ def build_one(row, mods, source, result, build, profile):
             raise ValueError(f"the library's identity {identity!r} is not {build[:12]} {mod} {version}")
         if build == verify_release_link.BUILD and abi == verify_release_link.ABI:
             try:
-                verify_release_link.verify(source, out / name, profile, source / ".release-verified")
+                verify_release_link.verify(source, out / name, profile, pathlib.Path(os.environ["RUSTPG_APK_REFERENCE"]))
             except (OSError, ValueError, subprocess.CalledProcessError) as e:
                 raise ValueError(f"official APK link verification failed: {e}") from e
         library = result / f"{job}.so"
