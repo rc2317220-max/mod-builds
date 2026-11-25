@@ -377,9 +377,13 @@ def build_one(row, mods, source, result, build, profile):
         # wants the panic strategy (`<build> <mod> <version> <rustc> unwind`).
         if not (len(words) == 4 or (len(words) == 5 and words[4] == "unwind")) or words[:3] != [build, mod, version]:
             raise ValueError(f"the library's identity {identity!r} is not {build[:12]} {mod} {version}")
-        if build == verify_release_link.BUILD and abi == verify_release_link.ABI:
+        paired = os.environ.get("RUSTPG_PAIRED_APK") == "1"
+        if paired or (build == verify_release_link.BUILD and abi == verify_release_link.ABI):
             try:
-                verify_release_link.verify(source, out / name, profile, pathlib.Path(os.environ["RUSTPG_APK_REFERENCE"]))
+                reference = pathlib.Path(os.environ["RUSTPG_APK_REFERENCE"])
+                if paired and (reference / "paired-build-id").read_text().strip() != build:
+                    raise ValueError("paired APK build identity mismatch")
+                verify_release_link.verify(source, out / name, profile, reference, paired=paired)
             except (OSError, ValueError, subprocess.CalledProcessError) as e:
                 raise ValueError(f"official APK link verification failed: {e}") from e
         library = result / f"{job}.so"
