@@ -36,6 +36,15 @@ def answer(result, built):
         with library.open("rb") as f:
             while chunk := f.read(1 << 20):
                 digest.update(chunk)
+        if os.environ.get("VERSION") == "0.9.0-preview.cac7bf6459":
+            # The publish runner never runs the result; validate its header only.
+            with library.open("rb") as f:
+                header = f.read(64)
+            if len(header) != 64 or header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[16:18], "little") != 3 or int.from_bytes(header[18:20], "little") != 183:
+                return "failed", failure("The result was not an ARM64 shared library.", False), None
+            about = status.get("build")
+            if not isinstance(about, dict) or about.get("version") != os.environ["VERSION"] or about.get("abi") != "arm64-v8a" or about.get("commit") != "cac7bf64590fb38b4badee90f1f09848ce7f8daa":
+                return "failed", failure("The result had the wrong Preview 4 identity.", False), None
         if library.stat().st_size == size and digest.hexdigest() == want:
             done = {"state": "done", "sha256": want, "size": size, "build": status.get("build")}
             return "done", done, library
@@ -59,11 +68,6 @@ def publish(result, job, ask, built, gh, out):
     # the job's first hex digit (worker/ looks there, then in the old `results`).
     results = f"results-{job[0]}"
     state, status, library = answer(result, built)
-    # A fresh fork may not have a result shard yet.
-    try:
-        gh("release", "view", results)
-    except subprocess.CalledProcessError:
-        gh("release", "create", results, "--target", "main", "--prerelease", "--title", results, "--notes", "Native build results", check=False)
     if state == "done":
         # The library first: its status is what says it is there.
         so = out / f"{job}.so"
