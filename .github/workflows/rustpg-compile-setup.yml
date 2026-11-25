@@ -1,8 +1,5 @@
 name: RustPG Compile server setup
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/rustpg-compile-setup.yml']
   workflow_dispatch:
     inputs:
       prepare_base:
@@ -20,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    if: github.event_name == 'push' || inputs.prepare_base
+    if: inputs.prepare_base
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -60,7 +57,12 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Missing CLOUDFLARE_API_TOKEN"; exit 1; }
-          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::Missing CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            account=$(curl -fsS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" 'https://api.cloudflare.com/client/v4/accounts?per_page=50' | jq -er 'select(.success == true and (.result | length) == 1 and ((.result_info.total_count // 1) == 1)) | .result[0].id') || { echo "::error::Could not identify exactly one Cloudflare account; set CLOUDFLARE_ACCOUNT_ID manually."; exit 1; }
+            [[ "$account" =~ ^[0-9a-f]{32}$ ]] || exit 1
+            echo "::add-mask::$account"
+            printf 'CLOUDFLARE_ACCOUNT_ID=%s\n' "$account" >> "$GITHUB_ENV"
+          fi
           test -n "$BUILD_REPO_TOKEN" || { echo "::error::Missing BUILD_REPO_TOKEN"; exit 1; }
           test "$GITHUB_REPOSITORY" = rc2317220-max/mod-builds
           GH_TOKEN="$BUILD_REPO_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq '.private == false and .fork == true' | grep -Fx true
