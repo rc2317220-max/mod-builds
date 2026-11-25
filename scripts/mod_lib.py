@@ -32,6 +32,7 @@ import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import store  # noqa: E402
+import verify_release_link
 
 # What an unpacked .hmod may be at most, and how many files (a zip bomb stops here).
 UNPACKED = 64 << 20
@@ -376,6 +377,11 @@ def build_one(row, mods, source, result, build, profile):
         # wants the panic strategy (`<build> <mod> <version> <rustc> unwind`).
         if not (len(words) == 4 or (len(words) == 5 and words[4] == "unwind")) or words[:3] != [build, mod, version]:
             raise ValueError(f"the library's identity {identity!r} is not {build[:12]} {mod} {version}")
+        if build == verify_release_link.BUILD and abi == verify_release_link.ABI:
+            try:
+                verify_release_link.verify(source, out / name, profile, source / ".release-verified")
+            except (OSError, ValueError, subprocess.CalledProcessError) as e:
+                raise ValueError(f"official APK link verification failed: {e}") from e
         library = result / f"{job}.so"
         shutil.copyfile(out / name, library)
         if store.sha256_of(library) != made.get("sha256"):
