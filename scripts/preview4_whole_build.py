@@ -65,7 +65,8 @@ def frame(body):
 
 def fingerprint(folder):
     h = hashlib.sha256()
-    files = sorted(p for p in folder.rglob("*") if p.is_file())
+    files = sorted((p for p in folder.rglob("*") if p.is_file()),
+                   key=lambda p: p.relative_to(folder).as_posix())
     for p in files:
         rel = p.relative_to(folder).as_posix()
         if rel.startswith(("assets/","data/")):
@@ -121,6 +122,28 @@ RUNTIME = """
     }
 """
 
+# Keep the exact previous trusted patch so warm Turbo bases can be migrated.
+RUNTIME_V1 = RUNTIME
+RUNTIME = RUNTIME.replace('x == "smod"', 'x == "smod" || x == "hnmod"')
+RUNTIME = RUNTIME.replace("candidates.sort();", 'candidates.sort_by_key(|p| (p.extension().is_some_and(|e| e == "smod"), p.clone()));')
+RUNTIME = RUNTIME.replace("let mut found = None;", "let mut found = None;\n            let mut refusals = Vec::new();")
+RUNTIME = RUNTIME.replace("let Ok(bundle) = crate::index::native::Bundle::read(path) else { continue; };", """let bundle = match crate::index::native::Bundle::read(path) {
+                    Ok(bundle) => bundle,
+                    Err(e) => { refusals.push(format!("{}: {e}", path.file_name().unwrap_or_default().to_string_lossy())); continue; }
+                };""")
+RUNTIME = RUNTIME.replace("if m.id != expected.id ||", "if m.id != expected.id { continue; }\n                if")
+RUNTIME = RUNTIME.replace("m.side != expected.side { continue; }", """m.side != expected.side {
+                    refusals.push(format!("{}: version/side mismatch: {} {:?}", expected.id, m.version, m.side));
+                    continue;
+                }""")
+RUNTIME = RUNTIME.replace('if format!("{:x}", sha.finalize()) != *want { continue; }', """let actual = format!("{:x}", sha.finalize());
+                if actual != *want {
+                    refusals.push(format!("{}: code fingerprint differs (expected {}, got {})", expected.id, want, actual));
+                    continue;
+                }""")
+RUNTIME = RUNTIME.replace('"Compiled mod {} changed or is missing; compile again.", expected.id', '"Compiled mod {} not loaded: {} candidate(s); {}", expected.id, candidates.len(), refusals.join("; ")')
+
+
 def fixed_once(path, old, new):
     """Apply a trusted, fixed patch once; refuse an unexpected source layout."""
     source = path.read_text()
@@ -151,18 +174,42 @@ def prepare_fixed_base():
     fixed_once(ROOT/"Cargo.toml", "members = [\n",
                'members = [\n    "rustpg-whole-mods/*",\n')
     runtime = ROOT/"crates/sunrise-mod-package/src/runtime.rs"
-    fixed_once(runtime, "impl Runtime {\n", "impl Runtime {\n" + RUNTIME)
+    if RUNTIME_V1 in runtime.read_text():
+        fixed_once(runtime, RUNTIME_V1, RUNTIME)
+    else:
+        fixed_once(runtime, "impl Runtime {\n", "impl Runtime {\n" + RUNTIME)
     android = ROOT/"crates/sunrise-client/src/android_lib.rs"
     fixed_once(android, "use winit::platform::android::activity::AndroidApp;",
                'use winit::platform::android::activity::AndroidApp;\n#[path = "../../sunrise-android/src/rustpg_whole.rs"]\nmod rustpg_whole;')
-    fixed_once(android, "let (entries, native) = native_libraries();",
-               """let (entries, native) = match rustpg_whole::load(&startup.launch().context.game_dir) {
+    old_load = """let (entries, native) = match rustpg_whole::load(&startup.launch().context.game_dir) {
         Ok(loaded) => loaded,
         Err(error) => {
             sunrise_client::android::warn(&error);
             Default::default()
         }
-    };""")
+    };"""
+    new_load = """let (entries, native, native_error) = match rustpg_whole::load(&startup.launch().context.game_dir) {
+        Ok((entries, native)) => (entries, native, None),
+        Err(error) => {
+            sunrise_client::android::warn(&error);
+            (Vec::new(), Default::default(), Some(error))
+        }
+    };"""
+    if old_load in android.read_text():
+        fixed_once(android, old_load, new_load)
+    else:
+        fixed_once(android, "let (entries, native) = native_libraries();", new_load)
+    fixed_once(android,
+               "move |native, launch| sunrise_mod_host::load_code(entries, native, launch),",
+               """move |native, launch| {
+            if let Some(error) = native_error {
+                log::error!("Starling whole-game native load failed: {error}");
+            } else {
+                log::info!("Starling whole-game native load: {} compiled mod(s): {:?}", native.built().len(),
+                    native.built().iter().map(|m| m.id).collect::<Vec<_>>());
+            }
+            sunrise_mod_host::load_code(entries, native, launch)
+        },""")
     registry = ROOT/"crates/sunrise-android/src/rustpg_whole.rs"
     registry.parent.mkdir(parents=True, exist_ok=True)
     if not registry.exists():
