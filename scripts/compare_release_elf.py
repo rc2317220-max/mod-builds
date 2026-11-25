@@ -27,6 +27,33 @@ def elf(path):
                           "sha256": None if typ == 8 else digest(data[off:off+size])}
     return {"size": len(data), "sha256": digest(data), "sections": out}
 
+def section_bytes(path, section):
+    data = path.read_bytes()
+    header = struct.unpack_from("<16sHHIQQQIHHHHHH", data)
+    shoff, shentsize, shnum, shstrndx = header[6], header[11], header[12], header[13]
+    entries = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize) for i in range(shnum)]
+    st = entries[shstrndx]
+    names = data[st[4]:st[4] + st[5]]
+    for name, typ, flags, addr, off, size, *_ in entries:
+        if names[name:names.index(b"\x00", name)].decode("ascii", "replace") == section:
+            return data[off:off+size] if typ != 8 else b""
+    return b""
+
+def diff_bytes(a, b):
+    count = abs(len(a)-len(b))
+    first = []
+    # Skip unchanged blocks to make large text sections inexpensive to inspect.
+    for start in range(0, min(len(a),len(b)), 65536):
+        x,y = a[start:start+65536],b[start:start+65536]
+        if x == y:
+            continue
+        for i,(u,v) in enumerate(zip(x,y)):
+            if u != v:
+                count += 1
+                if len(first) < 32:
+                    first.append({"offset": start+i, "rebuilt": hex(u), "official": hex(v)})
+    return {"changed_bytes": count, "first_changes": first}
+
 def exports(nm, path):
     return set(subprocess.check_output([nm, "-D", "--defined-only", "--format=just-symbols", str(path)], text=True).splitlines())
 
@@ -45,6 +72,8 @@ def main():
         diffs = {key: {"rebuilt": a["sections"].get(key), "official": b["sections"].get(key)}
                  for key in sorted(a["sections"].keys() | b["sections"].keys())
                  if a["sections"].get(key) != b["sections"].get(key)}
+        for key in diffs:
+            diffs[key]["bytes"] = diff_bytes(section_bytes(path,key), section_bytes(official,key))
         ea, eb = exports(str(nm), path), exports(str(nm), official)
         allocated = [k for k,v in diffs.items() if any(x and x["flags"] & 2 for x in v.values())]
         result[path.name] = {"identical": False, "rebuilt_size": a["size"], "official_size": b["size"],
