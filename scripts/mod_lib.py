@@ -330,6 +330,13 @@ def build_one(row, mods, source, result, build, profile):
                    "--profile", profile, "--abi", abi]
         env = {**os.environ, "RUSTFLAGS": "-C prefer-dynamic", "HORIZON_GAME_BUILD_ID": build,
                "SUNRISE_GAME_BUILD_ID": build}
+        if build == "ff303502a4f7982551a0e0d3622d9268efe9e829" and abi == "arm64-v8a":
+            # Match the official release build script, which reads git HEAD.
+            for key in ("HORIZON_GAME_BUILD_ID", "SUNRISE_GAME_BUILD_ID"):
+                env.pop(key, None)
+            actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+            if actual != build:
+                raise ValueError("base checkout has the wrong git identity")
         if (source / "functions.json").is_file() and (source / ".unstaged").is_dir():
             # A staged base (store_base.sh): mods with [native.*] rows build their patch crates.
             env.update(SUNRISE_UNSTAGED_SOURCE=str(source / ".unstaged"),
