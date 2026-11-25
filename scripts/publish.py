@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-LIBRARY = "libhorizon_android.so"
+LIBRARY = ("libsunrise_android.so" if os.environ.get("VERSION") == "0.9.0-preview.cac7bf6459" else "libhorizon_android.so")
 DID_NOT_FINISH = "The build on GitHub did not finish. Try again."
 
 
@@ -59,6 +59,11 @@ def publish(result, job, ask, built, gh, out):
     # the job's first hex digit (worker/ looks there, then in the old `results`).
     results = f"results-{job[0]}"
     state, status, library = answer(result, built)
+    # A fresh fork may not have a result shard yet.
+    try:
+        gh("release", "view", results)
+    except subprocess.CalledProcessError:
+        gh("release", "create", results, "--target", "main", "--prerelease", "--title", results, "--notes", "Native build results", check=False)
     if state == "done":
         # The library first: its status is what says it is there.
         so = out / f"{job}.so"
