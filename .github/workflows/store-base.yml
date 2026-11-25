@@ -61,12 +61,17 @@ jobs:
         run: bash scripts/room.sh clean
       - name: The game's build
         run: bash scripts/store_base.sh
+      - name: Compile and verify a real API-only mod against the official APK
+        if: inputs.build == 'ff303502a4f7982551a0e0d3622d9268efe9e829' && inputs.abi == 'arm64-v8a'
+        run: bash scripts/verify_release_probe.sh
       - name: Upload ELF mismatch diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: release-elf-comparison
-          path: ${{ runner.temp }}/elf-comparison.json
+          path: |
+            ${{ runner.temp }}/elf-comparison.json
+            ${{ runner.temp }}/release-probe-status.json
           if-no-files-found: ignore
       - uses: actions/cache/save@v4
         with:
