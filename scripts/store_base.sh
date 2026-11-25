@@ -13,7 +13,11 @@ set -euo pipefail
 [[ "${PROFILE:-}" =~ ^(fast|quick)$ ]] || { echo "Not a profile: ${PROFILE:-}"; exit 1; }
 triple=$(python3 -I -c 'import os, sys; sys.path.insert(0, "scripts"); import store; print(store.TARGETS[os.environ["ABI"]])')
 root=$HOME/store
+# The official v0.9.0 ARM64 release job 136616992041 actually used NDK 27.3.
 NDK=28.2.13676358
+if [ "$BUILD" = "ff303502a4f7982551a0e0d3622d9268efe9e829" ] && [ "$ABI" = arm64-v8a ]; then
+  NDK=27.3.13750724
+fi
 
 rm -rf "$root"
 git init -q "$root/source"
