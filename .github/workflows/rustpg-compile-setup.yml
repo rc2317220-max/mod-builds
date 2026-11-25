@@ -69,6 +69,23 @@ jobs:
           test -n "$BUILD_REPO_TOKEN" || { echo "::error::Missing BUILD_REPO_TOKEN"; exit 1; }
           test "$GITHUB_REPOSITORY" = rc2317220-max/mod-builds
           GH_TOKEN="$BUILD_REPO_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq '.private == false and .fork == true' | grep -Fx true
+      - name: Register workers.dev subdomain if absent
+        run: |
+          set -euo pipefail
+          endpoint="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"
+          current=$(curl -sS --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$endpoint")
+          if jq -e '.success and (.result.subdomain | type == "string" and length > 0)' <<< "$current" >/dev/null; then
+            echo "Existing workers.dev subdomain preserved."
+          else
+            if ! jq -e '(.errors // []) | any(.message | test("subdomain.*(not|no|exist|register)|not.*subdomain"; "i"))' <<< "$current" >/dev/null && ! jq -e '.success and ((.result.subdomain // "") == "")' <<< "$current" >/dev/null; then
+              jq -c '{success, errors}' <<< "$current"
+              exit 1
+            fi
+            name="rustpg-rc2317220"
+            response=$(curl -sS --max-time 30 -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" --data "$(jq -nc --arg name "$name" '{subdomain:$name}')" "$endpoint")
+            jq -e '.success == true' <<< "$response" >/dev/null || { jq -c '{success,errors}' <<< "$response"; exit 1; }
+            echo "Registered workers.dev subdomain."
+          fi
       - name: Test official Worker
         working-directory: worker
         run: npm ci && npm test
