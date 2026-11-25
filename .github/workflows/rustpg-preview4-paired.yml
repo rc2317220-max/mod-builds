@@ -1,0 +1,110 @@
+name: RustPG Sunrise Preview 4 paired compiler
+run-name: Sunrise Preview 4 Dev ARM64 and paired Compile v2 base
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/rustpg-preview4-paired.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rustpg-preview4-paired
+  cancel-in-progress: false
+jobs:
+  paired:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      ABI: arm64-v8a
+      PROFILE: fast
+    outputs:
+      build: ${{ steps.identity.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Unique paired ABI identity
+        id: identity
+        run: |
+          set -euo pipefail
+          build=$(printf '%s\n' "sunrise-preview4:custom-v2:$GITHUB_SHA:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" | sha1sum | cut -d' ' -f1)
+          echo "BUILD=$build" >> "$GITHUB_ENV"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Paired ABI identity: $build"
+      - name: Install exact Android toolchain
+        run: |
+          set -euo pipefail
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+            --install "ndk;27.3.13750724" "build-tools;35.0.0" "platforms;android-36" | tail -3
+      - name: Make room
+        run: bash scripts/room.sh clean
+      - name: Build matching client and compiler base
+        run: bash scripts/build_paired_preview.sh
+      - name: Compile real native Sunrise probe in isolated server sandbox
+        run: bash scripts/verify_preview_probe.sh
+      - name: Preserve verification evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview4-paired-probe
+          path: ${{ runner.temp }}/release-probe-status.json
+          if-no-files-found: ignore
+      - name: Save paired ABI cache
+        uses: actions/cache/save@v4
+        with:
+          key: store2-${{ env.BUILD }}-arm64-v8a-fast
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Upload separate Dev APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustPG-Sunrise-Preview4-arm64
+          path: ${{ runner.temp }}/RustPG-Sunrise-Preview4-arm64.apk
+          if-no-files-found: error
+  publish:
+    needs: paired
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: store
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ needs.paired.outputs.build }}
+      ABI: arm64-v8a
+      PROFILE: fast
+      NIGHTLY: RustPG-Sunrise-Preview4-Dev
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: RustPG-Sunrise-Preview4-arm64
+          path: release-apk
+      - name: Publish separate Dev APK and register verified compiler base
+        run: |
+          set -euo pipefail
+          [[ "$BUILD" =~ ^[0-9a-f]{40}$ ]]
+          tag="rustpg-preview4-${BUILD:0:12}"
+          file=release-apk/RustPG-Sunrise-Preview4-arm64.apk
+          sha256sum "$file"
+          gh release create "$tag" "$file" --target "$GITHUB_SHA" --prerelease \
+            --title "RustPG Sunrise Preview 4 Dev (ARM64)" \
+            --notes "Separate Dev app. Paired compiler ABI: $BUILD. Native probe verified; phone runtime not yet verified."
+          export APK="https://github.com/$GH_REPO/releases/download/$tag/RustPG-Sunrise-Preview4-arm64.apk"
+          python3 scripts/store.py register
+          echo "[Separate Dev APK]($APK)" >> "$GITHUB_STEP_SUMMARY"
