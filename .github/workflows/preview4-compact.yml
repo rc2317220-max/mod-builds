@@ -1,0 +1,147 @@
+name: Preview 4 compact compiler benchmark
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/preview4-compact.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Make room
+        run: |
+          rm -rf "$HOME/.rustup" "$HOME/.cargo"
+          bash scripts/room.sh
+      - name: Restore verified Turbo base
+        id: turbo
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-turbo-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-${{ hashFiles('scripts/preview4_whole_build.py', 'scripts/preview4_whole_base.sh', 'scripts/preview4_whole_sandbox.sh', 'scripts/preview4_jobs.sh') }}
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Restore legacy base on miss
+        uses: actions/cache/restore@v4
+        if: steps.turbo.outputs.cache-hit != 'true'
+        with:
+          key: preview4-v1-static-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-v1
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Prepare identical tiny native probe
+        run: |
+          python3 - <<'PY'
+          import io, pathlib, zipfile
+          out = io.BytesIO()
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+              z.writestr("sunrise-mod.toml", '''id = "compact_probe"
+          name = "Compact Probe"
+          version = "0.1.0"
+          api = "0.2"
+          side = "client"
+          [native]
+          game = "26.3"
+          sunrise = "cac7bf64590fb38b4badee90f1f09848ce7f8daa"
+          ''')
+              z.writestr("Cargo.toml", '''[package]
+          name = "compact-probe"
+          version = "0.1.0"
+          edition = "2024"
+          [dependencies]
+          sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
+          ''')
+              z.writestr("src/lib.rs", '''use mod_api::{Hooks, ClientHost, RenderPlayerPostEvent};
+          #[derive(Default)]
+          struct Probe;
+          #[mod_api::sunrise_mod]
+          impl Hooks for Probe {
+              fn render_player_post(&self, _: &dyn ClientHost, event: &mut RenderPlayerPostEvent<'_>) {
+                  if event.who.local {
+                      event.draw.quad("block/white_concrete", [[-0.1,2.1,-0.2],[-0.1,2.0,-0.2],[0.1,2.0,-0.2],[0.1,2.1,-0.2]], [0.0,0.0,16.0,16.0], 0xffffff);
+                  }
+              }
+          }
+          ''')
+          raw = out.getvalue()
+          pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
+          PY
+      - name: Compile baseline through existing offline sandbox
+        run: bash scripts/preview4_whole_sandbox.sh probe.bin baseline
+      - name: Create disposable compact compiler variant
+        run: |
+          cp -a scripts compact-scripts
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compact-scripts/preview4_whole_build.py")
+          s=p.read_text()
+          anchor='    env["CARGO_NET_OFFLINE"] = "true"'
+          assert s.count(anchor)==1
+          s=s.replace(anchor, anchor+'\n    env["CARGO_PROFILE_FAST_OPT_LEVEL"] = "s"\n    env["CARGO_PROFILE_FAST_LTO"] = "thin"\n    env["RUSTFLAGS"] = "-C link-arg=-Wl,--icf=safe"')
+          p.write_text(s)
+          PY
+          python3 -m py_compile compact-scripts/preview4_whole_build.py
+      - name: Compile compact variant in offline sandbox
+        env:
+          SANDBOX_SECONDS: '6600'
+        run: bash compact-scripts/preview4_whole_sandbox.sh probe.bin compact
+      - name: Compare actual stripped ELF files
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess
+          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          def run(tool, *args):
+              return subprocess.check_output([str(ndk/tool), *map(str,args)], text=True)
+          def inspect(name):
+              p=pathlib.Path(name)
+              st=json.loads((p/"status.json").read_text())
+              assert st["state"]=="done",st
+              f=p/"libsunrise_android.so"
+              with f.open("rb") as stream:
+                  assert hashlib.file_digest(stream,"sha256").hexdigest()==st["sha256"]
+              assert f.stat().st_size==st["size"]
+              h=run("llvm-readelf","-h",f)
+              assert "AArch64" in h and "DYN" in h
+              exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",f).splitlines())
+              assert "starling_on_create" in exports
+              needed=sorted(re.findall(r"Shared library: \[([^\]]+)\]",run("llvm-readelf","-d",f)))
+              sections=run("llvm-size","-A",f)
+              (p/"sections.txt").write_text(sections)
+              (p/"segments.txt").write_text(run("llvm-readelf","-lW",f))
+              return {"bytes":f.stat().st_size,"exports":exports,"needed":needed,"seconds":json.loads((p/"compile-metrics.json").read_text())["cargo_seconds"]}
+          a,b=inspect("baseline"),inspect("compact")
+          saving=100*(1-b["bytes"]/a["bytes"])
+          compatible=a["exports"]==b["exports"] and a["needed"]==b["needed"]
+          report={"baseline":a,"compact":b,"saving_percent":saving,"same_exports_and_dependencies":compatible,"size_gate_pass":compatible and saving>=5,"android_runtime_verified":False}
+          pathlib.Path("comparison.json").write_text(json.dumps(report,indent=2))
+          summary=f'Baseline: {a["bytes"]/1048576:.2f} MiB; compact: {b["bytes"]/1048576:.2f} MiB; reduction: {saving:.2f}%; exports/dependencies match: {compatible}. Android runtime NOT verified.'
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary+"\n")
+          assert report["size_gate_pass"],"No acceptable reduction or ELF interface changed"
+          PY
+      - name: Preserve measurements (never publish to player releases)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview4-compact-evidence
+          path: |
+            baseline/status.json
+            baseline/compile-metrics.json
+            baseline/sections.txt
+            baseline/segments.txt
+            compact/status.json
+            compact/compile-metrics.json
+            compact/sections.txt
+            compact/segments.txt
+            comparison.json
+          if-no-files-found: warn
