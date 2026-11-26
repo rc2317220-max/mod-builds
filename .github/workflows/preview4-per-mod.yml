@@ -1,0 +1,148 @@
+name: Preview 4 per-mod compiler laboratory
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/preview4-per-mod.yml'
+      - 'scripts/preview4_custom_v2.py'
+      - 'worker/src/index.js'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  original-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch and verify the exact original x86_64 APK
+        run: |
+          curl --fail --location --retry 3 https://github.com/starling-client/starling/releases/download/preview-2026.11.23.4/starling-preview-x86_64.apk -o original.apk
+          echo 'c7cce458826e8a4614f88264f716a9a4469ae98a5e9bd052ae76ede81e425595  original.apk' | sha256sum -c -
+          python3 - <<'PY'
+          import json, pathlib, re, subprocess, zipfile
+          with zipfile.ZipFile("original.apk") as z:
+              entries = [i for i in z.infolist() if i.filename.startswith("lib/x86_64/") and i.filename.endswith(".so")]
+              path = next(i for i in entries if i.filename.endswith("/libsunrise_android.so"))
+              pathlib.Path("original.so").write_bytes(z.read(path))
+              report = {"abi":"x86_64","engine_bytes":path.file_size,"libraries":[i.filename for i in entries],
+                        "dynamic_mod_host":any(i.filename.endswith("/libsunrise_mod_host.so") for i in entries)}
+              report["needed"] = re.findall(r"Shared library: \[([^\]]+)\]",subprocess.check_output(["readelf","-d","original.so"],text=True))
+          pathlib.Path("original-apk.json").write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PY
+      - name: Test custom store discovery and existing worker
+        working-directory: worker
+        run: |
+          npm test
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import worker from './src/index.js';
+          const r=await worker.fetch(new Request('https://example.com/v2/capabilities'),{REPO:'rc2317220-max/mod-builds'},{});
+          assert.equal(r.status,200);
+          assert.deepEqual(await r.json(),{schema:1,repo:'rc2317220-max/mod-builds',protocols:['v1','v2']});
+          JS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: original-preview4-inspection
+          path: original-apk.json
+  dynamic-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: x86_64
+            triple: x86_64-linux-android
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+    env:
+      PIN: cac7bf64590fb38b4badee90f1f09848ce7f8daa
+      ABI: ${{ matrix.abi }}
+      TRIPLE: ${{ matrix.triple }}
+      CARGO_BUILD_JOBS: '3'
+      RUSTFLAGS: '-C prefer-dynamic'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install matching tools
+        run: |
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" --install "ndk;27.3.13750724" "build-tools;35.0.0" "platforms;android-36" | tail -3
+          bash scripts/room.sh clean
+          echo "ANDROID_HOME=$HOME/android" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$HOME/android/ndk/27.3.13750724" >> "$GITHUB_ENV"
+      - name: Exact source and client patch
+        run: |
+          git init -q "$RUNNER_TEMP/sunrise"
+          git -C "$RUNNER_TEMP/sunrise" fetch --depth=1 https://github.com/starling-client/starling "$PIN"
+          git -C "$RUNNER_TEMP/sunrise" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/sunrise" rev-parse HEAD)" = "$PIN"
+          python3 scripts/preview4_custom_v2.py "$RUNNER_TEMP/sunrise"
+          git -C "$RUNNER_TEMP/sunrise" diff --check
+          git -C "$RUNNER_TEMP/sunrise" diff > client.patch
+          cd "$RUNNER_TEMP/sunrise"
+          GITHUB_ENV='' bash tools/ci/rustup_install.sh --profile minimal --component rust-src --target "$TRIPLE"
+          cargo install cargo-ndk --version 3.5.4 --locked
+          cargo fetch --locked
+          python3 tools/android_native_sdk.py prepare
+      - name: Build the one-time dynamic game and APK
+        run: |
+          cd "$RUNNER_TEMP/sunrise"
+          python3 packaging/android/build_apk.py --abi "$ABI" --profile fast --dev
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          cp target/android/starling-dev-*-"$ABI".apk "$GITHUB_WORKSPACE/evidence/"
+      - name: Build two API-only probe mods beside the same game
+        run: |
+          cd "$RUNNER_TEMP/sunrise"
+          python3 - <<'PY'
+          import zipfile
+          for name, tint in [("cape_probe","0xFFFFFF"),("cape_probe_two","0xFFAAFF")]:
+              with zipfile.ZipFile(name+".smod","w",zipfile.ZIP_DEFLATED) as z:
+                  z.writestr("sunrise-mod.toml",f'id="{name}"\nname="{name}"\nversion="0.1.0"\napi="0.2"\nside="client"\n[native]\ngame="26.3"\nsunrise="cac7bf64590fb38b4badee90f1f09848ce7f8daa"\n')
+                  z.writestr("Cargo.toml",f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2024"\n[dependencies]\nsunrise-mod-api={{path=".sunrise/sdk/api/crates/sunrise-mod-api"}}\n')
+                  z.writestr("src/lib.rs",'''use mod_api::{Hooks,ClientHost,RenderPlayerPostEvent};
+          #[derive(Default)]
+          struct Probe;
+          #[mod_api::sunrise_mod]
+          impl Hooks for Probe {
+              fn render_player_post(&self,_:&dyn ClientHost,e:&mut RenderPlayerPostEvent<'_>) {
+                  if e.who.local {
+                      e.draw.quad("block/white_concrete", [[-0.24,1.5,-0.24],[-0.3,0.45,-0.35],[0.3,0.45,-0.35],[0.24,1.5,-0.24]], [0.0,0.0,16.0,16.0], TINT);
+                  }
+              }
+          }'''.replace("TINT",tint))
+          PY
+          python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-one" cape_probe.smod --abi "$ABI" --profile fast
+          python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-two" cape_probe_two.smod --abi "$ABI" --profile fast
+      - name: Check the actual mod ELF dependencies against the exact candidate APK
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess, zipfile
+          root=pathlib.Path("evidence")
+          abi=os.environ["ABI"]
+          apk=next(root.glob("*.apk"))
+          with zipfile.ZipFile(apk) as z:
+              files={pathlib.PurePosixPath(i.filename).name:i.file_size for i in z.infolist() if i.filename.startswith("lib/"+abi+"/") and i.filename.endswith(".so")}
+          assert "libsunrise_mod_host.so" in files,files
+          ndk=pathlib.Path(os.environ["ANDROID_NDK_HOME"])/"toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          report={"abi":abi,"engine_entry_bytes":files["libsunrise_android.so"],"apk_bytes":apk.stat().st_size,"mods":[],"android_runtime_verified":False}
+          for path in [root/"probe-one/libcape_probe.so",root/"probe-two/libcape_probe_two.so"]:
+              needed=re.findall(r"Shared library: \[([^\]]+)\]",subprocess.check_output([str(ndk),"-d",str(path)],text=True))
+              missing=[n for n in needed if n.startswith(("libsunrise_","libmod_","libstd-","libemutls")) and n not in files]
+              assert not missing,missing
+              assert path.stat().st_size < 10*1024*1024, "API-only probe exceeds 10 MiB"
+              report["mods"].append({"name":path.name,"size":path.stat().st_size,"needed":needed})
+          (root/"per-mod-report.json").write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview4-per-mod-${{ matrix.abi }}
+          path: |
+            client.patch
+            evidence/
+          if-no-files-found: warn
