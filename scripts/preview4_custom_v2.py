@@ -17,6 +17,36 @@ def patch(root):
         nonlocal source
         assert source.count(old) == 1, f"changed source anchor: {old[:100]}"
         source = source.replace(old, new, 1)
+    # V1 is ARM64-only. Expose the compilation UI on x86_64 only on a
+    # dynamic installation, which will use the per-mod route exclusively.
+    once('const SERVICE_SUPPORTED: bool = cfg!(target_arch = "aarch64");', '''fn service_supported() -> bool {
+    cfg!(target_arch = "aarch64") || (cfg!(target_arch = "x86_64") && loads_store_builds())
+}''')
+    assert source.count("SERVICE_SUPPORTED") == 6, "changed architecture guard"
+    source = source.replace("SERVICE_SUPPORTED", "service_supported()")
+    # Only explicit engine modifications require rebuilding game code.
+    # Reject these before contacting the v2 store; never interpret ordinary
+    # Cargo errors or unsupported dependencies as permission to rebuild.
+    once("    let StoreWanted { mods: wanted, old } = store_wanted()?;", '''    let StoreWanted { mods: wanted, old } = store_wanted()?;
+    let mut engine_mods = Vec::new();
+    for (path, w) in &wanted {
+        let bundle = sunrise_mod_package::index::native::Bundle::read(path)
+            .map_err(|e| format!("{}: {e}", w.id))?;
+        if let Some(native) = &bundle.manifest.native {
+            if !native.mixin.is_empty() || !native.module.is_empty()
+                || !native.bridge.is_empty() || !native.state.is_empty()
+                || !native.r#loop.is_empty()
+            {
+                engine_mods.push(w.id.clone());
+            }
+        }
+    }
+    if !engine_mods.is_empty() {
+        return Ok(FromStore::NotHere(format!(
+            "{} require engine patches. This dynamic installation cannot apply those patches yet. Disable them to compile API-only mods.",
+            engine_mods.join(", ")
+        )));
+    }''')
     once("fn compile_from_store(\n    server: &str,", "fn compile_from_store(\n    server: &str,\n    repo: &str,")
     once('    say("Looking for your mods in the store...".into());\n    let repo = store::STORE_REPO;', '    say("Looking for your mods in the store...".into());')
     once("agent, server, &build, &missing, &wanted, shared, asked,", "agent, server, repo, &build, &missing, &wanted, shared, asked,")
