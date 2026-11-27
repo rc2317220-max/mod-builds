@@ -1,4 +1,4 @@
-name: Preview 4 V1 compact warmed profiles
+name: Preview 4 V1 size without LTO
 on:
   pull_request:
     paths:
@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [cold-paths, whole-size]
+        profile: [size-s, size-z]
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -102,19 +102,14 @@ jobs:
           profile=tomllib.loads(source)["profile"]["fast"]
           print("Original fast profile:",profile)
           mode=os.environ["CANDIDATE"]
-          if mode=="cold-paths":
-              chosen=["naga","starling-catalog","starling-account","sunrise-port-pack","sunrise-mod-package","sunrise-mod-registry","sunrise-server-files","sunrise-perf-share","ureq","rustls"]
-              existing=profile.get("package",{})
-              assert not set(chosen)&set(existing),("existing overrides",set(chosen)&set(existing))
-              manifest.write_text(source+"\n"+ "\n".join(f'\n[profile.fast.package."{name}"]\nopt-level = "s"\n' for name in chosen))
-              print("Size-optimized packages:",chosen)
-          elif mode=="whole-size":
+          if mode in ("size-s","size-z"):
+              opt=mode[-1]
               for folder in ("control-scripts","baseline-scripts"):
                   p=pathlib.Path(folder)/"preview4_whole_build.py"
                   s=p.read_text()
                   anchor='    env["CARGO_NET_OFFLINE"] = "true"'
                   assert s.count(anchor)==1
-                  p.write_text(s.replace(anchor,anchor+'\n    env["CARGO_PROFILE_FAST_OPT_LEVEL"] = "s"\n    env["CARGO_PROFILE_FAST_LTO"] = "thin"'))
+                  p.write_text(s.replace(anchor,anchor+'\n    env["CARGO_PROFILE_FAST_OPT_LEVEL"] = "'+opt+'"\n    env["CARGO_PROFILE_FAST_LTO"] = "false"'))
           else:
               raise RuntimeError(mode)
           PY
@@ -131,9 +126,10 @@ jobs:
           mv "$HOME/store/cargo" "$HOME/.cargo"
           cd "$HOME/store/source"
           extra=()
-          if [ "$CANDIDATE" = whole-size ]; then
-            extra=(CARGO_PROFILE_FAST_OPT_LEVEL=s CARGO_PROFILE_FAST_LTO=thin)
-          fi
+          case "$CANDIDATE" in
+            size-s|size-z) extra=(CARGO_PROFILE_FAST_OPT_LEVEL="${CANDIDATE##*-}" CARGO_PROFILE_FAST_LTO=false);;
+            *) exit 1;;
+          esac
           env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8 \
             ANDROID_HOME="$HOME/android" ANDROID_NDK_HOME="$HOME/android/ndk/27.3.13750724" \
             SUNRISE_GAME_BUILD_ID=cac7bf64590fb38b4badee90f1f09848ce7f8daa CARGO_BUILD_JOBS="$jobs" \
@@ -192,7 +188,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: compact-warm-${{ matrix.profile }}
+          name: no-lto-${{ matrix.profile }}
           path: |
             warm.log
             control.log
