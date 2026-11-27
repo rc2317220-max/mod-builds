@@ -18,12 +18,21 @@ def main():
     p.add_argument("source",type=Path)
     p.add_argument("dest",type=Path)
     p.add_argument("--link-only",action="store_true")
+    p.add_argument("--cache-control",action="store_true", help="Build trusted cached base without a request mod")
     a=p.parse_args()
     shutil.copytree(a.source,a.dest)
     sandbox=a.dest/"preview4_whole_sandbox.sh"
     s=sandbox.read_text()
-    s=once(s,'CARGO_NET_OFFLINE=true LANG=C.UTF-8','CARGO_NET_OFFLINE=true LANG=C.UTF-8 CARGO_LOG=cargo::core::compiler::fingerprint=info')
+    s=once(s,'CARGO_NET_OFFLINE=true LANG=C.UTF-8','CARGO_NET_OFFLINE=true LANG=C.UTF-8 CARGO_LOG=cargo::compiler::fingerprint=trace,cargo::core::compiler::fingerprint=trace CARGO_TERM_VERBOSE=true')
     sandbox.write_text(s)
+    if a.cache_control:
+        if a.link_only:
+            p.error("cache control and link-only are mutually exclusive")
+        build=a.dest/"preview4_whole_build.py"
+        s=build.read_text()
+        s=once(s, "    records = configure(body)\n", "    prepare_fixed_base()\n    records = []\n")
+        build.write_text(s)
+        return
     if not a.link_only:
         return
     build=a.dest/"preview4_whole_build.py"
