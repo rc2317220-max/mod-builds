@@ -1,0 +1,147 @@
+name: Preview 4 original APK fast relink
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/preview4-fast-relink.yml'
+      - 'scripts/preview4_relink_experiment.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: preview4-fast-relink-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Make room
+        run: |
+          rm -rf "$HOME/.rustup" "$HOME/.cargo"
+          bash scripts/room.sh
+      - name: Restore verified Turbo compiler base
+        id: turbo
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-turbo-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-${{ hashFiles('scripts/preview4_whole_build.py', 'scripts/preview4_whole_base.sh', 'scripts/preview4_whole_sandbox.sh', 'scripts/preview4_jobs.sh') }}
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Restore original base on miss
+        if: steps.turbo.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-static-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-v1
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Prepare one trusted API-only mod and isolated compiler variants
+        run: |
+          python3 scripts/preview4_relink_experiment.py scripts baseline-scripts
+          python3 scripts/preview4_relink_experiment.py scripts relink-scripts --link-only
+          python3 -m py_compile baseline-scripts/preview4_whole_build.py relink-scripts/preview4_whole_build.py
+          python3 - <<'PY'
+          import io, pathlib, zipfile
+          out=io.BytesIO()
+          with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
+              z.writestr("sunrise-mod.toml",'''id="relink_probe"
+          name="Relink Probe"
+          version="0.1.0"
+          api="0.2"
+          side="client"
+          [native]
+          game="26.3"
+          sunrise="cac7bf64590fb38b4badee90f1f09848ce7f8daa"
+          ''')
+              z.writestr("Cargo.toml",'''[package]
+          name="relink_probe"
+          version="0.1.0"
+          edition="2024"
+          [dependencies]
+          sunrise-mod-api={path=".sunrise/sdk/api/crates/sunrise-mod-api"}
+          ''')
+              z.writestr("src/lib.rs",'''use mod_api::{Hooks, ClientHost, RenderPlayerPostEvent};
+          #[derive(Default)]
+          struct Probe;
+          #[mod_api::sunrise_mod]
+          impl Hooks for Probe {
+              fn render_player_post(&self, _: &dyn ClientHost, e: &mut RenderPlayerPostEvent<'_>) {
+                  if e.who.local {
+                      e.draw.quad("block/white_concrete", [[-0.24,1.5,-0.24],[-0.3,0.45,-0.35],[0.3,0.45,-0.35],[0.24,1.5,-0.24]], [0.0,0.0,16.0,16.0], 0xffffff);
+                  }
+              }
+          }
+          ''')
+          raw=out.getvalue()
+          pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
+          PY
+      - name: Baseline v1 with Cargo invalidation diagnostics
+        run: |
+          set -o pipefail
+          bash baseline-scripts/preview4_whole_sandbox.sh probe.bin baseline 2>&1 | tee baseline.log
+      - name: Final-link-only v1 with identical cached inputs
+        run: |
+          set -o pipefail
+          bash relink-scripts/preview4_whole_sandbox.sh probe.bin relink 2>&1 | tee relink.log
+      - name: Measure raw downloadable ELF and cache invalidations
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          def run(tool,*args):
+              return subprocess.check_output([str(ndk/tool),*map(str,args)],text=True)
+          def inspect(name):
+              root=pathlib.Path(name)
+              st=json.loads((root/"status.json").read_text())
+              assert st["state"]=="done",st
+              so=root/"libsunrise_android.so"
+              with so.open("rb") as f:
+                  assert hashlib.file_digest(f,"sha256").hexdigest()==st["sha256"]
+              assert so.stat().st_size==st["size"]
+              header=run("llvm-readelf","-h",so)
+              assert "AArch64" in header and "DYN" in header
+              dyn=run("llvm-readelf","-d",so)
+              exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",so).splitlines())
+              assert "starling_on_create" in exports
+              log=pathlib.Path(name+".log").read_text(errors="replace")
+              dirty=[x for x in log.splitlines() if "fingerprint" in x and ("dirty" in x.lower() or "stale" in x.lower())]
+              (root/"fingerprint-reasons.txt").write_text("\n".join(dirty))
+              (root/"dynamic.txt").write_text(dyn)
+              (root/"sections.txt").write_text(run("llvm-size","-A",so))
+              return {"bytes":so.stat().st_size,"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"compiled_crates":re.findall(r"^\s*Compiling (\S+) v",log,re.M),"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn)),"exports":exports,"android_packed_relocations":"ANDROID_RELA" in dyn}
+          a,b=inspect("baseline"),inspect("relink")
+          report={"baseline":a,"relink":b,"size_reduction_percent":100*(1-b["bytes"]/a["bytes"]),"time_reduction_percent":100*(1-b["seconds"]/a["seconds"]),"android_runtime_verified":False}
+          pathlib.Path("relink-report.json").write_text(json.dumps(report,indent=2))
+          assert a["exports"]==b["exports"],"JNI exports differ"
+          assert a["needed"]==b["needed"],"system dependencies differ"
+          summary=f'Original v1: {a["bytes"]/1e6:.2f} MB, {a["seconds"]:.2f} s, {len(a["compiled_crates"])} crates; final-link candidate: {b["bytes"]/1e6:.2f} MB, {b["seconds"]:.2f} s, {len(b["compiled_crates"])} crates. Android runtime not tested.'
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary+"\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: original-apk-fast-relink-evidence
+          path: |
+            baseline.log
+            relink.log
+            baseline/status.json
+            baseline/compile-metrics.json
+            baseline/fingerprint-reasons.txt
+            baseline/sections.txt
+            baseline/dynamic.txt
+            relink/status.json
+            relink/compile-metrics.json
+            relink/fingerprint-reasons.txt
+            relink/sections.txt
+            relink/dynamic.txt
+            relink-report.json
+          if-no-files-found: warn
