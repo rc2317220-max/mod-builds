@@ -71,9 +71,20 @@ jobs:
             ~/android
             ~/store/source
             ~/store/cargo
-      - name: Restore original compiler base (fallback)
+      - name: Restore previous Turbo base during cache migration
+        id: previous_turbo
         uses: actions/cache/restore@v4
         if: inputs.version == '0.9.0-preview.cac7bf6459' && steps.turbo.outputs.cache-hit != 'true'
+        with:
+          key: preview4-v1-turbo-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-3c2bda13fb4176ca33639ea8516a1991304e11765849d91e0d5046b78fa6ac34
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Restore original compiler base (fallback)
+        uses: actions/cache/restore@v4
+        if: inputs.version == '0.9.0-preview.cac7bf6459' && steps.turbo.outputs.cache-hit != 'true' && steps.previous_turbo.outputs.cache-hit != 'true'
         with:
           key: preview4-v1-static-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-v1
           fail-on-cache-miss: true
