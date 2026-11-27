@@ -1,6 +1,7 @@
 name: Preview 4 original APK fast relink
 on:
-  pull_request:
+  push:
+    branches: [preview4-v1-fast-relink]
     paths:
       - '.github/workflows/preview4-fast-relink.yml'
       - 'scripts/preview4_relink_experiment.py'
@@ -45,9 +46,10 @@ jobs:
             ~/store/cargo
       - name: Prepare one trusted API-only mod and isolated compiler variants
         run: |
+          python3 scripts/preview4_relink_experiment.py scripts control-scripts --cache-control
           python3 scripts/preview4_relink_experiment.py scripts baseline-scripts
           python3 scripts/preview4_relink_experiment.py scripts relink-scripts --link-only
-          python3 -m py_compile baseline-scripts/preview4_whole_build.py relink-scripts/preview4_whole_build.py
+          python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py relink-scripts/preview4_whole_build.py
           python3 - <<'PY'
           import io, pathlib, zipfile
           out=io.BytesIO()
@@ -83,14 +85,21 @@ jobs:
           raw=out.getvalue()
           pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
           PY
+      - name: No-mod control of restored trusted base
+        run: |
+          set -o pipefail
+          bash control-scripts/preview4_whole_sandbox.sh probe.bin control >control.log 2>&1 || { tail -100 control.log; exit 1; }
+          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed|\\"state\\"' control.log | tail -100 || true
       - name: Baseline v1 with Cargo invalidation diagnostics
         run: |
           set -o pipefail
-          bash baseline-scripts/preview4_whole_sandbox.sh probe.bin baseline 2>&1 | tee baseline.log
+          bash baseline-scripts/preview4_whole_sandbox.sh probe.bin baseline >baseline.log 2>&1 || { tail -100 baseline.log; exit 1; }
+          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' baseline.log | tail -100 || true
       - name: Final-link-only v1 with identical cached inputs
         run: |
           set -o pipefail
-          bash relink-scripts/preview4_whole_sandbox.sh probe.bin relink 2>&1 | tee relink.log
+          bash relink-scripts/preview4_whole_sandbox.sh probe.bin relink >relink.log 2>&1 || { tail -100 relink.log; exit 1; }
+          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' relink.log | tail -100 || true
       - name: Measure raw downloadable ELF and cache invalidations
         run: |
           python3 - <<'PY'
@@ -112,18 +121,20 @@ jobs:
               exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",so).splitlines())
               assert "starling_on_create" in exports
               log=pathlib.Path(name+".log").read_text(errors="replace")
-              dirty=[x for x in log.splitlines() if "fingerprint" in x and ("dirty" in x.lower() or "stale" in x.lower())]
+              dirty=[x for x in log.splitlines() if re.search(r"\bdirty\b|stale|fingerprint error|fingerprint.*changed|missing fingerprint", x, re.I)]
               (root/"fingerprint-reasons.txt").write_text("\n".join(dirty))
               (root/"dynamic.txt").write_text(dyn)
               (root/"sections.txt").write_text(run("llvm-size","-A",so))
               return {"bytes":so.stat().st_size,"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"compiled_crates":re.findall(r"^\s*Compiling (\S+) v",log,re.M),"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn)),"exports":exports,"android_packed_relocations":"ANDROID_RELA" in dyn}
-          a,b=inspect("baseline"),inspect("relink")
-          report={"baseline":a,"relink":b,"size_reduction_percent":100*(1-b["bytes"]/a["bytes"]),"time_reduction_percent":100*(1-b["seconds"]/a["seconds"]),"android_runtime_verified":False}
+          c,a,b=inspect("control"),inspect("baseline"),inspect("relink")
+          report={"no_mod_control":c,"baseline":a,"relink":b,"size_reduction_percent":100*(1-b["bytes"]/a["bytes"]),"time_reduction_percent":100*(1-b["seconds"]/a["seconds"]),"android_runtime_verified":False}
           pathlib.Path("relink-report.json").write_text(json.dumps(report,indent=2))
           assert a["exports"]==b["exports"],"JNI exports differ"
           assert a["needed"]==b["needed"],"system dependencies differ"
           summary=f'Original v1: {a["bytes"]/1e6:.2f} MB, {a["seconds"]:.2f} s, {len(a["compiled_crates"])} crates; final-link candidate: {b["bytes"]/1e6:.2f} MB, {b["seconds"]:.2f} s, {len(b["compiled_crates"])} crates. Android runtime not tested.'
           print(summary)
+          print(f'No-mod control: {c["seconds"]:.2f} s; {len(c["compiled_crates"])} crates: {c["compiled_crates"]}')
+          print("Only with mod:", sorted(set(a["compiled_crates"])-set(c["compiled_crates"])))
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary+"\n")
           PY
       - uses: actions/upload-artifact@v4
@@ -131,6 +142,12 @@ jobs:
         with:
           name: original-apk-fast-relink-evidence
           path: |
+            control.log
+            control/status.json
+            control/compile-metrics.json
+            control/fingerprint-reasons.txt
+            control/sections.txt
+            control/dynamic.txt
             baseline.log
             relink.log
             baseline/status.json
