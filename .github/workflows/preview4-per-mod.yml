@@ -63,7 +63,6 @@ jobs:
       ABI: ${{ matrix.abi }}
       TRIPLE: ${{ matrix.triple }}
       CARGO_BUILD_JOBS: '3'
-      RUSTFLAGS: '-C prefer-dynamic'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,16 +84,23 @@ jobs:
           git -C "$RUNNER_TEMP/sunrise" diff > client.patch
           cd "$RUNNER_TEMP/sunrise"
           GITHUB_ENV='' bash tools/ci/rustup_install.sh --profile minimal --component rust-src --target "$TRIPLE"
-          cargo install cargo-ndk --version 3.5.4 --locked
+          env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo install cargo-ndk --version 3.5.4 --locked --force
+          cargo ndk --version
+          ldd "$(command -v cargo-ndk)" | tee "$GITHUB_WORKSPACE/host-tool-ldd.txt"
+          if grep -q "not found" "$GITHUB_WORKSPACE/host-tool-ldd.txt"; then exit 1; fi
           cargo fetch --locked
           python3 tools/android_native_sdk.py prepare
       - name: Build the one-time dynamic game and APK
+        env:
+          RUSTFLAGS: '-C prefer-dynamic'
         run: |
           cd "$RUNNER_TEMP/sunrise"
           python3 packaging/android/build_apk.py --abi "$ABI" --profile fast --dev
           mkdir -p "$GITHUB_WORKSPACE/evidence"
           cp target/android/starling-dev-*-"$ABI".apk "$GITHUB_WORKSPACE/evidence/"
       - name: Build two API-only probe mods beside the same game
+        env:
+          RUSTFLAGS: '-C prefer-dynamic'
         run: |
           cd "$RUNNER_TEMP/sunrise"
           python3 - <<'PY'
@@ -115,8 +121,9 @@ jobs:
               }
           }'''.replace("TINT",tint))
           PY
-          python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-one" cape_probe.smod --abi "$ABI" --profile fast
-          python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-two" cape_probe_two.smod --abi "$ABI" --profile fast
+          set -o pipefail
+          /usr/bin/time -f "elapsed_seconds=%e" python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-one" cape_probe.smod --abi "$ABI" --profile fast 2>&1 | tee "$GITHUB_WORKSPACE/evidence/probe-one.log"
+          /usr/bin/time -f "elapsed_seconds=%e" python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-two" cape_probe_two.smod --abi "$ABI" --profile fast 2>&1 | tee "$GITHUB_WORKSPACE/evidence/probe-two.log"
       - name: Check the actual mod ELF dependencies against the exact candidate APK
         run: |
           python3 - <<'PY'
@@ -144,5 +151,6 @@ jobs:
           name: preview4-per-mod-${{ matrix.abi }}
           path: |
             client.patch
+            host-tool-ldd.txt
             evidence/
           if-no-files-found: warn
