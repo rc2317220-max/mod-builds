@@ -1,4 +1,4 @@
-name: Preview 4 V1 download size and protocol
+name: Preview 4 V1 exact transport capability
 on:
   pull_request:
     paths:
@@ -45,231 +45,41 @@ jobs:
           print("Restored newest Naga files:", winners, latest)
           assert winners == [root / "build.rs"], winners
           PY
-      - name: Prepare trusted API-only probe and controls
-        run: |
-          python3 scripts/preview4_relink_experiment.py scripts control-scripts --cache-control
-          python3 scripts/preview4_relink_experiment.py scripts baseline-scripts
-          python3 scripts/preview4_relink_experiment.py scripts relink-scripts --link-only
-          python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py
-          python3 - <<'PY'
-          import io, pathlib, zipfile
-          out=io.BytesIO()
-          with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
-              z.writestr("sunrise-mod.toml",'''id="relink_probe"
-          name="Relink Probe"
-          version="0.1.0"
-          api="0.2"
-          side="client"
-          [native]
-          game="26.3"
-          sunrise="cac7bf64590fb38b4badee90f1f09848ce7f8daa"
-          ''')
-              z.writestr("Cargo.toml",'''[package]
-          name="relink_probe"
-          version="0.1.0"
-          edition="2024"
-          [dependencies]
-          sunrise-mod-api={path=".sunrise/sdk/api/crates/sunrise-mod-api"}
-          ''')
-              z.writestr("src/lib.rs",'''use mod_api::{Hooks, ClientHost, RenderPlayerPostEvent};
-          #[derive(Default)]
-          struct Probe;
-          #[mod_api::sunrise_mod]
-          impl Hooks for Probe {
-              fn render_player_post(&self, _: &dyn ClientHost, e: &mut RenderPlayerPostEvent<'_>) {
-                  if e.who.local {
-                      e.draw.quad("block/white_concrete", [[-0.24,1.5,-0.24],[-0.3,0.45,-0.35],[0.3,0.45,-0.35],[0.24,1.5,-0.24]], [0.0,0.0,16.0,16.0], 0xffffff);
-                  }
-              }
-          }
-          ''')
-          raw=out.getvalue()
-          pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
-          PY
-      - name: No-mod control in original isolated sandbox
-        run: |
-          set -o pipefail
-          bash control-scripts/preview4_whole_sandbox.sh probe.bin control >control.log 2>&1 || { tail -100 control.log; exit 1; }
-          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' control.log | tail -100 || true
-      - name: V1 mod with unchanged linker and original sandbox
-        run: |
-          set -o pipefail
-          bash baseline-scripts/preview4_whole_sandbox.sh probe.bin baseline >baseline.log 2>&1 || { tail -100 baseline.log; exit 1; }
-          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' baseline.log | tail -100 || true
-      - name: Measure cache reuse and validate V1 ELF
-        run: |
-          python3 - <<'PY'
-          import hashlib,json,os,pathlib,re,subprocess
-          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          def run(tool,*args):
-              return subprocess.check_output([str(ndk/tool),*map(str,args)],text=True)
-          def inspect(name):
-              root=pathlib.Path(name)
-              st=json.loads((root/"status.json").read_text())
-              assert st["state"]=="done",st
-              so=root/"libsunrise_android.so"
-              with so.open("rb") as f:
-                  assert hashlib.file_digest(f,"sha256").hexdigest()==st["sha256"]
-              assert so.stat().st_size==st["size"]
-              header=run("llvm-readelf","-h",so)
-              assert "AArch64" in header and "DYN" in header
-              dyn=run("llvm-readelf","-d",so)
-              exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",so).splitlines())
-              assert "starling_on_create" in exports
-              log=pathlib.Path(name+".log").read_text(errors="replace")
-              dirty=[x for x in log.splitlines() if re.search(r"\bdirty\b|stale|fingerprint error|fingerprint.*changed",x,re.I)]
-              (root/"fingerprint-reasons.txt").write_text("\n".join(dirty))
-              (root/"dynamic.txt").write_text(dyn)
-              (root/"exports.txt").write_text("\n".join(exports))
-              (root/"sections.txt").write_text(run("llvm-size","-A",so))
-              return {"bytes":so.stat().st_size,"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"compiled_crates":re.findall(r"^\s*Compiling (\S+) v",log,re.M),"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn)),"exports":exports,"sha256":st["sha256"]}
-          c,a=inspect("control"),inspect("baseline")
-          expected={"liblog.so","libandroid.so","libdl.so","libaaudio.so","libm.so","libc.so"}
-          unexpected_control=set(c["compiled_crates"])
-          unexpected_mod=set(a["compiled_crates"])-{"smod-relink_probe","sunrise-android"}
-          report={"previous_no_mod_seconds":680.676,"previous_mod_seconds":634.782,"control":c,"mod":a,"control_unexpected":sorted(unexpected_control),"mod_unexpected":sorted(unexpected_mod),"mod_time_reduction_percent":100*(1-a["seconds"]/634.782),"android_runtime_verified":False}
-          pathlib.Path("freshness-report.json").write_text(json.dumps(report,indent=2))
-          summary=f'Control: {c["seconds"]:.2f}s, {c["compiled_crates"]}; V1 mod: {a["seconds"]:.2f}s, {a["compiled_crates"]}, {a["bytes"]/1e6:.2f} MB; reduction: {report["mod_time_reduction_percent"]:.2f}%. Android runtime not tested.'
-          print(summary)
-          print("Unexpected rebuilt crates:",sorted(unexpected_control),sorted(unexpected_mod))
-          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary+"\n")
-          assert c["exports"]==a["exports"],"export mismatch"
-          assert set(c["needed"])==set(a["needed"])==expected,"unexpected system libraries"
-          assert not unexpected_control,"no-mod cache is not fresh"
-          assert not unexpected_mod,"unexpected game crate rebuild"
-          assert {"smod-relink_probe","sunrise-android"} <= set(a["compiled_crates"]),"probe or final JNI library was not compiled"
-          PY
-      - name: Inspect pinned Android V1 download protocol
+      - name: Audit exact Android HTTP features and V1 downloader
         run: |
           set -euo pipefail
           cd "$HOME/store/source"
           test "$(git rev-parse HEAD)" = cac7bf64590fb38b4badee90f1f09848ce7f8daa
-          # Locate and print exact source paths/lines, not current upstream.
-          git grep -n -I -E '/v1/job|/v1/build|results-[^ ]*|Accept-Encoding|Content-Encoding|GZIPInputStream|gzip|\\.so"' -- packaging/android crates > "$GITHUB_WORKSPACE/protocol-matches.txt" || true
-          grep -Ei '/v1/job|/v1/build|releases/download|Accept-Encoding|Content-Encoding|GZIPInputStream' "$GITHUB_WORKSPACE/protocol-matches.txt" | head -120 || true
-          git grep -l -I -E '/v1/job|/v1/build|results-.*\\.json' -- packaging/android crates > "$GITHUB_WORKSPACE/protocol-paths.txt" || true
-          while IFS= read -r p; do
-            printf '\n==== %s ====\n' "$p"
-            git show "HEAD:$p" | grep -n -C 12 -E '/v1/job|/v1/build|releases/download|Accept-Encoding|Content-Encoding|GZIPInputStream|download_library|downloadLibrary' || true
-          done < "$GITHUB_WORKSPACE/protocol-paths.txt" > "$GITHUB_WORKSPACE/protocol-source.txt"
-          head -180 "$GITHUB_WORKSPACE/protocol-source.txt"
-      - name: Final-link candidate on fixed cache
-        run: |
-          set -euo pipefail
-          python3 -m py_compile relink-scripts/preview4_whole_build.py
-          bash relink-scripts/preview4_whole_sandbox.sh probe.bin relink >relink.log 2>&1 || { tail -100 relink.log; exit 1; }
-          grep -Ei 'Dirty|Compiling |Cargo build elapsed' relink.log | tail -60 || true
-      - name: Measure raw ELF, safe stripping, and lossless transport alternatives
-        run: |
-          set -euo pipefail
+          export CARGO_HOME="$HOME/store/cargo" RUSTUP_HOME="$HOME/.rustup"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          export CARGO_NET_OFFLINE=true
+          cargo tree --offline -p sunrise-android --target aarch64-linux-android -e normal,build -f '{p} features=[{f}]' > "$GITHUB_WORKSPACE/http-feature-tree.txt"
+          grep -E 'ureq v|flate2 v' "$GITHUB_WORKSPACE/http-feature-tree.txt" | sort -u
+          git grep -n -I -E 'ureq[[:space:]]*=|ureq/(gzip|brotli)' -- '*Cargo.toml' > "$GITHUB_WORKSPACE/ureq-manifests.txt" || true
+          cat "$GITHUB_WORKSPACE/ureq-manifests.txt"
+          git show HEAD:crates/sunrise-client/src/game/starling/native_builds.rs > "$GITHUB_WORKSPACE/native_builds.rs"
+          git show HEAD:crates/sunrise-client/src/starling_store.rs > "$GITHUB_WORKSPACE/starling_store.rs"
+          grep -n -C 8 -E 'Accept-Encoding|Content-Encoding|into_reader|[Rr]ange|fn .*download|[Gg]zip|[Zz]std|AgentBuilder|download.*\(' "$GITHUB_WORKSPACE/native_builds.rs" "$GITHUB_WORKSPACE/starling_store.rs" > "$GITHUB_WORKSPACE/downloader-excerpts.txt" || true
+          cat "$GITHUB_WORKSPACE/downloader-excerpts.txt" | tail -250
           python3 - <<'PY'
-          import gzip,hashlib,json,pathlib,re,shutil,subprocess,time
-          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          base=pathlib.Path("baseline/libsunrise_android.so")
-          relink=pathlib.Path("relink/libsunrise_android.so")
-          control=pathlib.Path("control/libsunrise_android.so")
-          out=pathlib.Path("size-evidence")
-          out.mkdir()
-          def run(tool,*args):
-              return subprocess.check_output([str(ndk/tool),*map(str,args)],text=True)
-          def digest(p):
-              with p.open("rb") as f: return hashlib.file_digest(f,"sha256").hexdigest()
-          def inspect(p,label):
-              hdr=run("llvm-readelf","-h",p)
-              assert "AArch64" in hdr and "DYN" in hdr
-              dyn=run("llvm-readelf","-d",p)
-              sections=run("llvm-size","-A",p)
-              exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",p).splitlines())
-              assert "starling_on_create" in exports
-              (out/(label+"-sections.txt")).write_text(sections)
-              (out/(label+"-dynamic.txt")).write_text(dyn)
-              (out/(label+"-program-headers.txt")).write_text(run("llvm-readelf","-lW",p))
-              return {"bytes":p.stat().st_size,"sha256":digest(p),"exports":exports,"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn))}
-          stripped=out/"strip-debug.so"
-          subprocess.run([str(ndk/"llvm-strip"),"--strip-debug","-o",str(stripped),str(base)],check=True)
-          allstrip=out/"strip-all.so"
-          subprocess.run([str(ndk/"llvm-strip"),"--strip-all","-o",str(allstrip),str(base)],check=True)
-          raw={k:inspect(p,k) for k,p in (("original",base),("final-link",relink),("strip-debug",stripped),("strip-all",allstrip))}
-          for k,v in raw.items():
-              v["matches_dynamic_abi"]=(v["exports"]==raw["original"]["exports"] and v["needed"]==raw["original"]["needed"])
-              v["reduction_percent"]=100*(1-v["bytes"]/raw["original"]["bytes"])
-              assert v["matches_dynamic_abi"],k
-              print(k,v["bytes"],"bytes; reduction",round(v["reduction_percent"],2),"%")
-          # Transport-only experiments: never publish compressed bytes as a .so.
-          transport={}
-          for level in (1,6,9):
-              dest=out/f"original-gzip-{level}.gz"
-              t=time.monotonic()
-              with base.open("rb") as src,dest.open("wb") as dst,gzip.GzipFile(filename="",fileobj=dst,mode="wb",compresslevel=level,mtime=0) as gz:
-                  shutil.copyfileobj(src,gz)
-              elapsed=time.monotonic()-t
-              with gzip.open(dest,"rb") as f:
-                  assert hashlib.file_digest(f,"sha256").hexdigest()==raw["original"]["sha256"]
-              transport[f"gzip-{level}"]={"bytes":dest.stat().st_size,"encode_seconds":elapsed,"reduction_percent":100*(1-dest.stat().st_size/base.stat().st_size)}
-              dest.unlink()
-          zstd=shutil.which("zstd")
-          if zstd:
-              for level in (3,12):
-                  dest=out/f"original-zstd-{level}.zst"
-                  t=time.monotonic()
-                  subprocess.run([zstd,"-q",f"-{level}","-f",str(base),"-o",str(dest)],check=True)
-                  elapsed=time.monotonic()-t
-                  with subprocess.Popen([zstd,"-q","-d","-c",str(dest)],stdout=subprocess.PIPE) as p:
-                      assert hashlib.file_digest(p.stdout,"sha256").hexdigest()==raw["original"]["sha256"]
-                      assert p.wait()==0
-                  transport[f"zstd-{level}"]={"bytes":dest.stat().st_size,"encode_seconds":elapsed,"reduction_percent":100*(1-dest.stat().st_size/base.stat().st_size)}
-                  dest.unlink()
-              # Only an upper-bound experiment: a real client needs this exact
-              # base hash plus a supported patch decoder. Do not assume stock APK.
-              dest=out/"delta.zst"
-              t=time.monotonic()
-              cmd=[zstd,"-q","-3","--patch-from="+str(control),str(base),"-o",str(dest)]
-              p=subprocess.run(cmd,capture_output=True,text=True)
-              if p.returncode==0:
-                  elapsed=time.monotonic()-t
-                  with subprocess.Popen([zstd,"-q","-d","--patch-from="+str(control),"-c",str(dest)],stdout=subprocess.PIPE) as proc:
-                      assert hashlib.file_digest(proc.stdout,"sha256").hexdigest()==raw["original"]["sha256"]
-                      assert proc.wait()==0
-                  transport["zstd-delta-from-no-mod-control"]={"bytes":dest.stat().st_size,"encode_seconds":elapsed,"required_base_sha256":digest(control)}
-                  dest.unlink()
-              else:
-                  transport["zstd-delta-error"]=p.stderr[-500:]
-          for k,v in transport.items(): print(k,json.dumps(v))
-          log=pathlib.Path("relink.log").read_text(errors="replace")
-          compiled=re.findall(r"^\s*Compiling (\S+) v",log,re.M)
-          assert set(compiled)<= {"smod-relink_probe","sunrise-android"},compiled
-          report={"raw":raw,"transport_diagnostic_only":transport,"relink_compiled_crates":compiled,"relink_metrics":json.loads(pathlib.Path("relink/compile-metrics.json").read_text()),"stock_client_transport_verified":False,"android_runtime_verified":False}
-          (out/"report.json").write_text(json.dumps(report,indent=2))
-          stripped.unlink()
-          allstrip.unlink()
+          import json, pathlib, re
+          root=pathlib.Path(__import__("os").environ["GITHUB_WORKSPACE"])
+          tree=(root/"http-feature-tree.txt").read_text()
+          rows=sorted(set(re.findall(r"ureq v(\S+) features=\[([^\]]*)\]",tree)))
+          if not rows: raise RuntimeError("no resolved HTTP library found")
+          report={"ureq_resolved_features":[{"version":v,"features":f.split(",") if f else []} for v,f in rows],"gzip_feature_in_graph":any("gzip" in f.split(",") for _,f in rows),"runtime_verified":False}
+          (root/"transport-capability.json").write_text(json.dumps(report,indent=2))
+          print(json.dumps(report))
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: preview4-download-evidence
+          name: exact-transport-evidence
           path: |
-            control.log
-            baseline.log
-            control/status.json
-            control/compile-metrics.json
-            control/fingerprint-reasons.txt
-            control/cargo-timing.html
-            control/exports.txt
-            control/dynamic.txt
-            control/sections.txt
-            baseline/status.json
-            baseline/compile-metrics.json
-            baseline/fingerprint-reasons.txt
-            baseline/cargo-timing.html
-            baseline/exports.txt
-            baseline/dynamic.txt
-            baseline/sections.txt
-            freshness-report.json
-            relink.log
-            relink/status.json
-            relink/compile-metrics.json
-            protocol-matches.txt
-            protocol-paths.txt
-            protocol-source.txt
-            size-evidence/
+            http-feature-tree.txt
+            ureq-manifests.txt
+            native_builds.rs
+            starling_store.rs
+            downloader-excerpts.txt
+            transport-capability.json
           if-no-files-found: warn
