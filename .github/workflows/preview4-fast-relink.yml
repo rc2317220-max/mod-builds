@@ -1,7 +1,6 @@
 name: Preview 4 original APK fast relink
 on:
-  push:
-    branches: [preview4-v1-fast-relink]
+  pull_request:
     paths:
       - '.github/workflows/preview4-fast-relink.yml'
       - 'scripts/preview4_relink_experiment.py'
@@ -89,7 +88,7 @@ jobs:
         run: |
           set -o pipefail
           bash control-scripts/preview4_whole_sandbox.sh probe.bin control >control.log 2>&1 || { tail -100 control.log; exit 1; }
-          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed|\\"state\\"' control.log | tail -100 || true
+          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' control.log | tail -100 || true
       - name: Baseline v1 with Cargo invalidation diagnostics
         run: |
           set -o pipefail
