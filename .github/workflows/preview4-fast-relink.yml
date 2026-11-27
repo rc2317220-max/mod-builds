@@ -1,4 +1,4 @@
-name: Preview 4 V1 Naga cache freshness
+name: Preview 4 V1 download size and protocol
 on:
   pull_request:
     paths:
@@ -11,100 +11,7 @@ concurrency:
   group: preview4-fast-relink-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  warm:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Make room
-        run: |
-          rm -rf "$HOME/.rustup" "$HOME/.cargo"
-          bash scripts/room.sh
-      - name: Restore verified Turbo compiler base
-        id: turbo
-        uses: actions/cache/restore@v4
-        with:
-          key: preview4-v1-turbo-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-${{ hashFiles('scripts/preview4_whole_build.py', 'scripts/preview4_whole_base.sh', 'scripts/preview4_whole_sandbox.sh', 'scripts/preview4_jobs.sh') }}
-          path: |
-            ~/.rustup
-            ~/android
-            ~/store/source
-            ~/store/cargo
-      - name: Restore original base on miss
-        if: steps.turbo.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          key: preview4-v1-static-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-v1
-          fail-on-cache-miss: true
-          path: |
-            ~/.rustup
-            ~/android
-            ~/store/source
-            ~/store/cargo
-      - name: Establish one unique newest Naga source before warming
-        run: |
-          set -euo pipefail
-          cd "$HOME/store/source"
-          test "$(git rev-parse HEAD)" = cac7bf64590fb38b4badee90f1f09848ce7f8daa
-          git diff --exit-code HEAD -- third_party/naga
-          python3 - <<'PY'
-          import hashlib, os, pathlib, stat, time
-          root = pathlib.Path("third_party/naga")
-          chosen = root / "build.rs"
-          assert chosen.is_file() and not chosen.is_symlink()
-          files = [p for p in root.rglob("*") if not p.is_symlink() and p.is_file()]
-          assert chosen in files
-          previous = max(p.stat().st_mtime_ns for p in files)
-          # Whole-second unique maximum survives loss of subsecond precision.
-          # Set before compiling; never rewrite Cargo fingerprints or backdate
-          # changed sources. The checkout and source contents remain identical.
-          now = time.time_ns() // 1_000_000_000 * 1_000_000_000
-          if now <= previous:
-              raise RuntimeError("source timestamps not safely older than current time")
-          before = hashlib.sha256(chosen.read_bytes()).hexdigest()
-          os.utime(chosen, ns=(chosen.stat().st_atime_ns, now))
-          assert hashlib.sha256(chosen.read_bytes()).hexdigest() == before
-          assert [p for p in files if p.stat().st_mtime_ns == now] == [chosen]
-          print("Naga unique newest file:", chosen, now, "old maximum:", previous)
-          PY
-          git diff --exit-code HEAD -- third_party/naga
-      - name: Rewarm only the trusted source (no request mods)
-        run: |
-          set -euo pipefail
-          scripts="$GITHUB_WORKSPACE/scripts"
-          source "$scripts/preview4_jobs.sh"
-          jobs=$(preview4_jobs)
-          test ! -e "$HOME/.cargo"
-          mv "$HOME/store/cargo" "$HOME/.cargo"
-          cd "$HOME/store/source"
-          python3 -I "$scripts/preview4_whole_build.py" --prepare-base
-          env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8 \
-            ANDROID_HOME="$HOME/android" ANDROID_NDK_HOME="$HOME/android/ndk/27.3.13750724" \
-            SUNRISE_GAME_BUILD_ID=cac7bf64590fb38b4badee90f1f09848ce7f8daa CARGO_BUILD_JOBS="$jobs" \
-            CARGO_NET_OFFLINE=true CARGO_LOG=cargo::compiler::fingerprint=info \
-            python3 packaging/android/build_apk.py --abi arm64-v8a --profile fast --library-only \
-            >"$GITHUB_WORKSPACE/warm.log" 2>&1 || { tail -100 "$GITHUB_WORKSPACE/warm.log"; exit 1; }
-          grep -Ei 'Dirty|Compiling |Finished' "$GITHUB_WORKSPACE/warm.log" | tail -100 || true
-          mv "$HOME/.cargo" "$HOME/store/cargo"
-          git diff --exit-code HEAD -- third_party/naga
-      - uses: actions/cache/save@v4
-        with:
-          key: preview4-v1-naga-freshness-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ~/.rustup
-            ~/android
-            ~/store/source
-            ~/store/cargo
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: naga-trusted-warm-log
-          path: warm.log
-          if-no-files-found: warn
   benchmark:
-    needs: warm
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -118,7 +25,7 @@ jobs:
       - name: Restore experimental warmed base on a different runner
         uses: actions/cache/restore@v4
         with:
-          key: preview4-v1-naga-freshness-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: preview4-v1-naga-freshness-v1-45997417249-1
           fail-on-cache-miss: true
           path: |
             ~/.rustup
@@ -142,6 +49,7 @@ jobs:
         run: |
           python3 scripts/preview4_relink_experiment.py scripts control-scripts --cache-control
           python3 scripts/preview4_relink_experiment.py scripts baseline-scripts
+          python3 scripts/preview4_relink_experiment.py scripts relink-scripts --link-only
           python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py
           python3 - <<'PY'
           import io, pathlib, zipfile
@@ -231,10 +139,114 @@ jobs:
           assert not unexpected_mod,"unexpected game crate rebuild"
           assert {"smod-relink_probe","sunrise-android"} <= set(a["compiled_crates"]),"probe or final JNI library was not compiled"
           PY
+      - name: Inspect pinned Android V1 download protocol
+        run: |
+          set -euo pipefail
+          cd "$HOME/store/source"
+          test "$(git rev-parse HEAD)" = cac7bf64590fb38b4badee90f1f09848ce7f8daa
+          # Locate and print exact source paths/lines, not current upstream.
+          git grep -n -I -E '/v1/job|/v1/build|results-[^ ]*|Accept-Encoding|Content-Encoding|GZIPInputStream|gzip|\\.so"' -- packaging/android crates > "$GITHUB_WORKSPACE/protocol-matches.txt" || true
+          grep -Ei '/v1/job|/v1/build|releases/download|Accept-Encoding|Content-Encoding|GZIPInputStream' "$GITHUB_WORKSPACE/protocol-matches.txt" | head -120 || true
+          git grep -l -I -E '/v1/job|/v1/build|results-.*\\.json' -- packaging/android crates > "$GITHUB_WORKSPACE/protocol-paths.txt" || true
+          while IFS= read -r p; do
+            printf '\n==== %s ====\n' "$p"
+            git show "HEAD:$p" | grep -n -C 12 -E '/v1/job|/v1/build|releases/download|Accept-Encoding|Content-Encoding|GZIPInputStream|download_library|downloadLibrary' || true
+          done < "$GITHUB_WORKSPACE/protocol-paths.txt" > "$GITHUB_WORKSPACE/protocol-source.txt"
+          head -180 "$GITHUB_WORKSPACE/protocol-source.txt"
+      - name: Final-link candidate on fixed cache
+        run: |
+          set -euo pipefail
+          python3 -m py_compile relink-scripts/preview4_whole_build.py
+          bash relink-scripts/preview4_whole_sandbox.sh probe.bin relink >relink.log 2>&1 || { tail -100 relink.log; exit 1; }
+          grep -Ei 'Dirty|Compiling |Cargo build elapsed' relink.log | tail -60 || true
+      - name: Measure raw ELF, safe stripping, and lossless transport alternatives
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip,hashlib,json,pathlib,re,shutil,subprocess,time
+          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          base=pathlib.Path("baseline/libsunrise_android.so")
+          relink=pathlib.Path("relink/libsunrise_android.so")
+          control=pathlib.Path("control/libsunrise_android.so")
+          out=pathlib.Path("size-evidence")
+          out.mkdir()
+          def run(tool,*args):
+              return subprocess.check_output([str(ndk/tool),*map(str,args)],text=True)
+          def digest(p):
+              with p.open("rb") as f: return hashlib.file_digest(f,"sha256").hexdigest()
+          def inspect(p,label):
+              hdr=run("llvm-readelf","-h",p)
+              assert "AArch64" in hdr and "DYN" in hdr
+              dyn=run("llvm-readelf","-d",p)
+              sections=run("llvm-size","-A",p)
+              exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",p).splitlines())
+              assert "starling_on_create" in exports
+              (out/(label+"-sections.txt")).write_text(sections)
+              (out/(label+"-dynamic.txt")).write_text(dyn)
+              (out/(label+"-program-headers.txt")).write_text(run("llvm-readelf","-lW",p))
+              return {"bytes":p.stat().st_size,"sha256":digest(p),"exports":exports,"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn))}
+          stripped=out/"strip-debug.so"
+          subprocess.run([str(ndk/"llvm-strip"),"--strip-debug","-o",str(stripped),str(base)],check=True)
+          allstrip=out/"strip-all.so"
+          subprocess.run([str(ndk/"llvm-strip"),"--strip-all","-o",str(allstrip),str(base)],check=True)
+          raw={k:inspect(p,k) for k,p in (("original",base),("final-link",relink),("strip-debug",stripped),("strip-all",allstrip))}
+          for k,v in raw.items():
+              v["matches_dynamic_abi"]=(v["exports"]==raw["original"]["exports"] and v["needed"]==raw["original"]["needed"])
+              v["reduction_percent"]=100*(1-v["bytes"]/raw["original"]["bytes"])
+              assert v["matches_dynamic_abi"],k
+              print(k,v["bytes"],"bytes; reduction",round(v["reduction_percent"],2),"%")
+          # Transport-only experiments: never publish compressed bytes as a .so.
+          transport={}
+          for level in (1,6,9):
+              dest=out/f"original-gzip-{level}.gz"
+              t=time.monotonic()
+              with base.open("rb") as src,dest.open("wb") as dst,gzip.GzipFile(filename="",fileobj=dst,mode="wb",compresslevel=level,mtime=0) as gz:
+                  shutil.copyfileobj(src,gz)
+              elapsed=time.monotonic()-t
+              with gzip.open(dest,"rb") as f:
+                  assert hashlib.file_digest(f,"sha256").hexdigest()==raw["original"]["sha256"]
+              transport[f"gzip-{level}"]={"bytes":dest.stat().st_size,"encode_seconds":elapsed,"reduction_percent":100*(1-dest.stat().st_size/base.stat().st_size)}
+              dest.unlink()
+          zstd=shutil.which("zstd")
+          if zstd:
+              for level in (3,12):
+                  dest=out/f"original-zstd-{level}.zst"
+                  t=time.monotonic()
+                  subprocess.run([zstd,"-q",f"-{level}","-f",str(base),"-o",str(dest)],check=True)
+                  elapsed=time.monotonic()-t
+                  with subprocess.Popen([zstd,"-q","-d","-c",str(dest)],stdout=subprocess.PIPE) as p:
+                      assert hashlib.file_digest(p.stdout,"sha256").hexdigest()==raw["original"]["sha256"]
+                      assert p.wait()==0
+                  transport[f"zstd-{level}"]={"bytes":dest.stat().st_size,"encode_seconds":elapsed,"reduction_percent":100*(1-dest.stat().st_size/base.stat().st_size)}
+                  dest.unlink()
+              # Only an upper-bound experiment: a real client needs this exact
+              # base hash plus a supported patch decoder. Do not assume stock APK.
+              dest=out/"delta.zst"
+              t=time.monotonic()
+              cmd=[zstd,"-q","-3","--patch-from="+str(control),str(base),"-o",str(dest)]
+              p=subprocess.run(cmd,capture_output=True,text=True)
+              if p.returncode==0:
+                  elapsed=time.monotonic()-t
+                  with subprocess.Popen([zstd,"-q","-d","--patch-from="+str(control),"-c",str(dest)],stdout=subprocess.PIPE) as proc:
+                      assert hashlib.file_digest(proc.stdout,"sha256").hexdigest()==raw["original"]["sha256"]
+                      assert proc.wait()==0
+                  transport["zstd-delta-from-no-mod-control"]={"bytes":dest.stat().st_size,"encode_seconds":elapsed,"required_base_sha256":digest(control)}
+                  dest.unlink()
+              else:
+                  transport["zstd-delta-error"]=p.stderr[-500:]
+          for k,v in transport.items(): print(k,json.dumps(v))
+          log=pathlib.Path("relink.log").read_text(errors="replace")
+          compiled=re.findall(r"^\s*Compiling (\S+) v",log,re.M)
+          assert set(compiled)<= {"smod-relink_probe","sunrise-android"},compiled
+          report={"raw":raw,"transport_diagnostic_only":transport,"relink_compiled_crates":compiled,"relink_metrics":json.loads(pathlib.Path("relink/compile-metrics.json").read_text()),"stock_client_transport_verified":False,"android_runtime_verified":False}
+          (out/"report.json").write_text(json.dumps(report,indent=2))
+          stripped.unlink()
+          allstrip.unlink()
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: naga-freshness-evidence
+          name: preview4-download-evidence
           path: |
             control.log
             baseline.log
@@ -253,4 +265,11 @@ jobs:
             baseline/dynamic.txt
             baseline/sections.txt
             freshness-report.json
+            relink.log
+            relink/status.json
+            relink/compile-metrics.json
+            protocol-matches.txt
+            protocol-paths.txt
+            protocol-source.txt
+            size-evidence/
           if-no-files-found: warn
