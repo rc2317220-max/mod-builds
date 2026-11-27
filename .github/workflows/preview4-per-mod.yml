@@ -90,6 +90,7 @@ jobs:
           if grep -q "not found" "$GITHUB_WORKSPACE/host-tool-ldd.txt"; then exit 1; fi
           cargo fetch --locked
           python3 tools/android_native_sdk.py prepare
+          df -h "$RUNNER_TEMP"
       - name: Build the one-time dynamic game and APK
         env:
           RUSTFLAGS: '-C prefer-dynamic'
@@ -122,26 +123,56 @@ jobs:
           }'''.replace("TINT",tint))
           PY
           set -o pipefail
+          export CARGO_NET_OFFLINE=true
           /usr/bin/time -f "elapsed_seconds=%e" python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-one" cape_probe.smod --abi "$ABI" --profile fast 2>&1 | tee "$GITHUB_WORKSPACE/evidence/probe-one.log"
           /usr/bin/time -f "elapsed_seconds=%e" python3 tools/android_native_sdk.py mods "$GITHUB_WORKSPACE/evidence/probe-two" cape_probe_two.smod --abi "$ABI" --profile fast 2>&1 | tee "$GITHUB_WORKSPACE/evidence/probe-two.log"
       - name: Check the actual mod ELF dependencies against the exact candidate APK
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, re, subprocess, zipfile
+          import hashlib, json, os, pathlib, re, subprocess, tempfile, zipfile
           root=pathlib.Path("evidence")
           abi=os.environ["ABI"]
           apk=next(root.glob("*.apk"))
-          with zipfile.ZipFile(apk) as z:
-              files={pathlib.PurePosixPath(i.filename).name:i.file_size for i in z.infolist() if i.filename.startswith("lib/"+abi+"/") and i.filename.endswith(".so")}
-          assert "libsunrise_mod_host.so" in files,files
-          ndk=pathlib.Path(os.environ["ANDROID_NDK_HOME"])/"toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          report={"abi":abi,"engine_entry_bytes":files["libsunrise_android.so"],"apk_bytes":apk.stat().st_size,"mods":[],"android_runtime_verified":False}
-          for path in [root/"probe-one/libcape_probe.so",root/"probe-two/libcape_probe_two.so"]:
-              needed=re.findall(r"Shared library: \[([^\]]+)\]",subprocess.check_output([str(ndk),"-d",str(path)],text=True))
-              missing=[n for n in needed if n.startswith(("libsunrise_","libmod_","libstd-","libemutls")) and n not in files]
-              assert not missing,missing
-              assert path.stat().st_size < 10*1024*1024, "API-only probe exceeds 10 MiB"
-              report["mods"].append({"name":path.name,"size":path.stat().st_size,"needed":needed})
+          src=pathlib.Path(os.environ["RUNNER_TEMP"])/"sunrise"
+          target=src/"target"/os.environ["TRIPLE"]
+          bin_dir=pathlib.Path(os.environ["ANDROID_NDK_HOME"])/"toolchains/llvm/prebuilt/linux-x86_64/bin"
+          def needed(path):
+              return re.findall(r"Shared library: \[([^\]]+)\]",subprocess.check_output([str(bin_dir/"llvm-readelf"),"-d",str(path)],text=True))
+          with zipfile.ZipFile(apk) as z, tempfile.TemporaryDirectory() as temp:
+              files={}
+              for i in z.infolist():
+                  if i.filename.startswith("lib/"+abi+"/") and i.filename.endswith(".so"):
+                      name=pathlib.PurePosixPath(i.filename).name
+                      p=pathlib.Path(temp)/name
+                      p.write_bytes(z.read(i))
+                      files[name]=p
+              assert "libsunrise_mod_host.so" in files,files
+              report={"abi":abi,"engine_entry_bytes":files["libsunrise_android.so"].stat().st_size,"apk_bytes":apk.stat().st_size,"mods":[],"android_runtime_verified":False}
+              for path in [root/"probe-one/libcape_probe.so",root/"probe-two/libcape_probe_two.so"]:
+                  direct=needed(path)
+                  pending=list(direct)
+                  checked={}
+                  while pending:
+                      name=pending.pop()
+                      if name in checked:
+                          continue
+                      if name not in files:
+                          assert not name.startswith(("libsunrise_","libmod_","libstd-","libemutls")),name
+                          continue
+                      original=files[name]
+                      candidates=[target/"fast"/"deps"/name,target/"fast"/name,target/"emutls"/name]
+                      current=next((p for p in candidates if p.is_file()),None)
+                      assert current is not None, f"missing SDK library: {name}"
+                      stripped=pathlib.Path(temp)/("check-"+name)
+                      subprocess.run([str(bin_dir/"llvm-strip"),"--strip-unneeded","-o",str(stripped),str(current)],check=True)
+                      def digest(p):
+                          with p.open("rb") as f:
+                              return hashlib.file_digest(f,"sha256").hexdigest()
+                      assert digest(original)==digest(stripped),f"SDK library changed after mod compilation: {name}"
+                      checked[name]=digest(original)
+                      pending.extend(needed(original))
+                  assert path.stat().st_size < 10*1024*1024, "API-only probe exceeds 10 MiB"
+                  report["mods"].append({"name":path.name,"size":path.stat().st_size,"needed":direct,"matched_sdk_dependencies":checked})
           (root/"per-mod-report.json").write_text(json.dumps(report,indent=2))
           print(json.dumps(report,indent=2))
           PY
