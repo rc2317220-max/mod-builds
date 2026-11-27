@@ -1,0 +1,282 @@
+name: RustPG Preview 4 compact compiler
+run-name: Size-Z ARM64 cache and verified V1 probes (no APK)
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rustpg-preview4-compact.yml'
+      - 'scripts/preview4_whole_build.py'
+      - 'scripts/preview4_whole_base.sh'
+      - 'scripts/preview4_whole_sandbox.sh'
+      - 'scripts/preview4_jobs.sh'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rustpg-preview4-compact
+  cancel-in-progress: false
+jobs:
+  base:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Make room
+        run: |
+          rm -rf "$HOME/.rustup" "$HOME/.cargo"
+          bash scripts/room.sh
+      - name: Restore corrected standard Turbo cache
+        id: turbo
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-turbo-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-${{ hashFiles('scripts/preview4_whole_build.py', 'scripts/preview4_whole_base.sh', 'scripts/preview4_whole_sandbox.sh', 'scripts/preview4_jobs.sh') }}
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Restore previous trusted Turbo cache if needed
+        id: old
+        if: steps.turbo.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-turbo-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-3c2bda13fb4176ca33639ea8516a1991304e11765849d91e0d5046b78fa6ac34
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Install Android toolchain if neither base is available
+        if: steps.turbo.outputs.cache-hit != 'true' && steps.old.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+            --install "ndk;27.3.13750724" "build-tools;35.0.0" "platforms;android-36" | tail -3
+          bash scripts/preview4_whole_base.sh --turbo
+      - name: Prepare pinned Size-Z profile and stable Naga timestamp
+        run: |
+          set -euo pipefail
+          cd "$HOME/store/source"
+          test "$(git rev-parse HEAD)" = cac7bf64590fb38b4badee90f1f09848ce7f8daa
+          git diff --exit-code HEAD -- third_party/naga
+          python3 -I "$GITHUB_WORKSPACE/scripts/preview4_whole_build.py" --prepare-base
+          python3 - <<'PY'
+          import hashlib,os,pathlib,re,time,tomllib
+          p=pathlib.Path("Cargo.toml")
+          s=p.read_text()
+          profile=tomllib.loads(s)["profile"]["fast"]
+          assert profile.get("lto") is False and "opt-level" not in profile,profile
+          s,n=re.subn(r"(?m)^\[profile\.fast\][ \t]*(?:#.*)?$",lambda m:m.group()+"\nopt-level = \"z\"",s)
+          assert n==1
+          assert tomllib.loads(s)["profile"]["fast"]["opt-level"]=="z"
+          p.write_text(s)
+          root=pathlib.Path("third_party/naga")
+          chosen=root/"build.rs"
+          assert chosen.is_file() and not chosen.is_symlink()
+          files=[p for p in root.rglob("*") if p.is_file() and not p.is_symlink()]
+          prev=max(p.stat().st_mtime_ns for p in files)
+          if [p for p in files if p.stat().st_mtime_ns==prev] != [chosen]:
+              now=time.time_ns()//1_000_000_000*1_000_000_000
+              if now<=prev:
+                  delay=(prev//1_000_000_000+1)-time.time()
+                  if delay>2: raise RuntimeError("unexpected future timestamps")
+                  time.sleep(max(0,delay)+0.05)
+                  now=time.time_ns()//1_000_000_000*1_000_000_000
+              assert now>prev
+              digest=hashlib.sha256(chosen.read_bytes()).hexdigest()
+              os.utime(chosen,ns=(chosen.stat().st_atime_ns,now))
+              assert hashlib.sha256(chosen.read_bytes()).hexdigest()==digest
+          latest=max(p.stat().st_mtime_ns for p in files)
+          assert [p for p in files if p.stat().st_mtime_ns==latest]==[chosen]
+          print("Prepared profile:",tomllib.loads(s)["profile"]["fast"],"Naga unique mtime:",latest)
+          PY
+          git diff --exit-code HEAD -- third_party/naga
+      - name: Warm trusted compact profile (no request mods)
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/scripts/preview4_jobs.sh"
+          jobs=$(preview4_jobs)
+          test ! -e "$HOME/.cargo"
+          mv "$HOME/store/cargo" "$HOME/.cargo"
+          cd "$HOME/store/source"
+          env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8 \
+            ANDROID_HOME="$HOME/android" ANDROID_NDK_HOME="$HOME/android/ndk/27.3.13750724" \
+            SUNRISE_GAME_BUILD_ID=cac7bf64590fb38b4badee90f1f09848ce7f8daa CARGO_BUILD_JOBS="$jobs" \
+            CARGO_NET_OFFLINE=true \
+            python3 packaging/android/build_apk.py --abi arm64-v8a --profile fast --library-only >"$GITHUB_WORKSPACE/warm.log" 2>&1 || { tail -100 "$GITHUB_WORKSPACE/warm.log"; exit 1; }
+          tail -20 "$GITHUB_WORKSPACE/warm.log"
+          mv "$HOME/.cargo" "$HOME/store/cargo"
+      - name: Generate a real native player rendering probe
+        run: |
+          python3 - <<'PY'
+          import io, pathlib, zipfile
+          out=io.BytesIO()
+          with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
+              z.writestr("sunrise-mod.toml",'''id = "rustpg_preview4_probe"
+          name = "RustPG Preview 4 Probe"
+          version = "0.1.0"
+          api = "0.2"
+          side = "client"
+          [native]
+          game = "26.3"
+          sunrise = "cac7bf64590fb38b4badee90f1f09848ce7f8daa"
+          ''')
+              z.writestr("Cargo.toml",'''[package]
+          name = "rustpg-preview4-probe"
+          version = "0.1.0"
+          edition = "2024"
+          [dependencies]
+          sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
+          ''')
+              z.writestr("src/lib.rs",'''use mod_api::{Hooks, ClientHost, RenderPlayerPostEvent};
+          #[derive(Default)]
+          struct Probe;
+          #[mod_api::sunrise_mod]
+          impl Hooks for Probe {
+              fn render_player_post(&self, _: &dyn ClientHost, event: &mut RenderPlayerPostEvent<'_>) {
+                  if event.who.local {
+                      let _ = event.player.age;
+                      if let Some(model) = event.model {
+                          let _ = model.part("head");
+                      }
+                      event.draw.quad("block/white_concrete", [[-0.1,2.1,0.0],[-0.1,2.0,0.0],[0.1,2.0,0.0],[0.1,2.1,0.0]], [0.0,0.0,16.0,16.0], 0x111111);
+                  }
+              }
+          }
+          ''')
+          raw=out.getvalue()
+          pathlib.Path("probe.smod").write_bytes(raw)
+          pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
+          PY
+      - name: Compile probe through the same offline v1 route as the phone
+        run: bash scripts/preview4_whole_sandbox.sh probe.bin result
+      - name: Verify compiled original-client result
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib,struct
+          p=pathlib.Path("result")
+          r=json.loads((p/"status.json").read_text())
+          print(json.dumps(r,indent=2))
+          assert r["state"]=="done",r
+          so=p/"libsunrise_android.so"
+          with so.open("rb") as f:
+              hdr=f.read(64)
+              f.seek(0)
+              assert hashlib.file_digest(f,"sha256").hexdigest()==r["sha256"]
+          assert hdr[:6]==b"\x7fELF\x02\x01" and struct.unpack_from("<HH",hdr,16)==(3,183)
+          assert r["build"]["abi"]=="arm64-v8a"
+          assert r["build"]["version"]=="0.9.0-preview.cac7bf6459"
+          assert r["build"]["mods"]==[{"id":"rustpg_preview4_probe","version":"0.1.0"}]
+          PY
+      - name: Compile a distinct mod combination using the same immutable base
+        run: |
+          python3 - <<'PY'
+          import io, pathlib, zipfile
+          original=pathlib.Path("probe.smod").read_bytes()
+          second=io.BytesIO()
+          with zipfile.ZipFile(io.BytesIO(original)) as src, zipfile.ZipFile(second,"w",zipfile.ZIP_DEFLATED) as dst:
+              for name in src.namelist():
+                  data=src.read(name)
+                  if name=="sunrise-mod.toml":
+                      data=data.replace(b"rustpg_preview4_probe",b"rustpg_turbo_probe_second").replace(b'0.1.0',b'0.1.1')
+                  if name=="Cargo.toml":
+                      data=data.replace(b"rustpg-preview4-probe",b"rustpg-turbo-probe-second").replace(b'0.1.0',b'0.1.1')
+                  if name=="src/lib.rs":
+                      data=data.replace(b"0x111111",b"0x555555")
+                  dst.writestr(name,data)
+          raw=second.getvalue()
+          pathlib.Path("probe-second.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
+          PY
+          bash scripts/preview4_whole_sandbox.sh probe-second.bin result-second
+      - name: Verify second result and enforce speed gate
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib,struct
+          p=pathlib.Path("result-second")
+          r=json.loads((p/"status.json").read_text())
+          assert r["state"]=="done",r
+          so=p/"libsunrise_android.so"
+          with so.open("rb") as f:
+              hdr=f.read(64)
+              f.seek(0)
+              assert hashlib.file_digest(f,"sha256").hexdigest()==r["sha256"]
+          assert hdr[:6]==b"\x7fELF\x02\x01" and struct.unpack_from("<HH",hdr,16)==(3,183)
+          assert r["build"]["abi"]=="arm64-v8a"
+          assert r["build"]["commit"]=="cac7bf64590fb38b4badee90f1f09848ce7f8daa"
+          assert r["build"]["mods"]==[{"id":"rustpg_turbo_probe_second","version":"0.1.1"}]
+          a,b=[json.loads((pathlib.Path(d)/"compile-metrics.json").read_text())["cargo_seconds"] for d in ("result","result-second")]
+          summary=f"Size-Z two distinct probes: {a:.1f} s, {b:.1f} s.\n"
+          print(summary)
+          import os
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary)
+          # Conservative deployment: both probes must beat the measured baseline by 20%.
+          assert max(a,b)<30,"Compact cache does not meet the speed gate"
+          PY
+      - name: Verify no-mod control through same offline sandbox
+        run: |
+          cp -a scripts control-scripts
+          python3 - <<'PY'
+          import pathlib
+          p=pathlib.Path("control-scripts/preview4_whole_build.py")
+          s=p.read_text()
+          anchor="    records = configure(body)\n"
+          assert s.count(anchor)==1
+          p.write_text(s.replace(anchor,"    prepare_fixed_base()\n    records = []\n"))
+          PY
+          bash control-scripts/preview4_whole_sandbox.sh probe.bin control >control.log 2>&1 || { tail -100 control.log; exit 1; }
+          cat control.log | tail -30
+          if grep -Eq '^[[:space:]]*Compiling[[:space:]]' control.log; then
+            echo 'Unexpected recompilation in no-mod control' >&2
+            exit 1
+          fi
+      - name: Validate compact size, status and dynamic ABI before activating cache
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib,re,subprocess
+          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          expected={"libaaudio.so","libandroid.so","libc.so","libdl.so","liblog.so","libm.so"}
+          expected_exports={"ANativeActivity_onCreate","Java_io_github_juanluci_starling_DiagnosticsActivity_makeReport","Java_io_github_juanluci_starling_StarlingActivity_nativeDocumentResult","Java_io_github_juanluci_starling_StarlingActivity_onImeHeight","Java_io_github_juanluci_starling_StarlingActivity_onPointerCaptureLost","Java_io_github_juanluci_starling_StarlingActivity_onSafeInsets","Java_io_github_juanluci_starling_StarlingActivity_onStorage","Java_io_github_juanluci_starling_TextMirror_onMirrorAction","Java_io_github_juanluci_starling_TextMirror_onMirrorEdit","Java_io_github_juanluci_starling_TextMirror_onMirrorKey","android_main","starling_on_create"}
+          report={}
+          for name in ("control","result","result-second"):
+              root=pathlib.Path(name)
+              st=json.loads((root/"status.json").read_text())
+              assert st["state"]=="done",st
+              so=root/"libsunrise_android.so"
+              with so.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==st["sha256"]
+              assert so.stat().st_size==st["size"]<95000000
+              def tool(exe,*args): return subprocess.check_output([str(ndk/exe),*args,str(so)],text=True)
+              dyn=tool("llvm-readelf","-d")
+              exports=set(tool("llvm-nm","-D","--defined-only","--format=just-symbols").splitlines())
+              assert exports==expected_exports,exports
+              assert set(re.findall(r"Shared library: \[([^\]]+)\]",dyn))==expected,dyn
+              report[name]={"bytes":st["size"],"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"sha256":st["sha256"]}
+          assert report["control"]["seconds"]<15
+          assert max(report["result"]["seconds"],report["result-second"]["seconds"])<30
+          report["android_runtime_verified"]=False
+          pathlib.Path("compact-production-report.json").write_text(json.dumps(report,indent=2))
+          print(json.dumps(report))
+          PY
+      - name: Publish validated compact cache to production
+        uses: actions/cache/save@v4
+        with:
+          key: preview4-v1-size-z-cac7bf64590fb38b4badee90f1f09848ce7f8daa-arm64-v8a-v1-${{ hashFiles('scripts/preview4_whole_build.py', 'scripts/preview4_whole_base.sh', 'scripts/preview4_whole_sandbox.sh', 'scripts/preview4_jobs.sh') }}
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compact-production-evidence
+          path: |
+            warm.log
+            control.log
+            compact-production-report.json
+            result/status.json
+            result/compile-metrics.json
+            result-second/status.json
+            result-second/compile-metrics.json
+          if-no-files-found: warn
