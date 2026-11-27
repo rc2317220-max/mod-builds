@@ -1,0 +1,208 @@
+name: Preview 4 V1 size without LTO
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/preview4-fast-relink.yml'
+      - 'scripts/preview4_relink_experiment.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: preview4-fast-relink-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [size-s, size-z]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Make room
+        run: |
+          rm -rf "$HOME/.rustup" "$HOME/.cargo"
+          bash scripts/room.sh
+      - name: Restore experimental warmed base on a different runner
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-naga-freshness-v1-45997417249-1
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Verify unique timestamp survived cache archive and restore
+        run: |
+          cd "$HOME/store/source"
+          git diff --exit-code HEAD -- third_party/naga
+          python3 - <<'PY'
+          import pathlib
+          root = pathlib.Path("third_party/naga")
+          files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()]
+          latest = max(p.stat().st_mtime_ns for p in files)
+          winners = [p for p in files if p.stat().st_mtime_ns == latest]
+          print("Restored newest Naga files:", winners, latest)
+          assert winners == [root / "build.rs"], winners
+          PY
+      - name: Prepare trusted API-only probe and controls
+        run: |
+          python3 scripts/preview4_relink_experiment.py scripts control-scripts --cache-control
+          python3 scripts/preview4_relink_experiment.py scripts baseline-scripts
+          python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py
+          python3 - <<'PY'
+          import io, pathlib, zipfile
+          out=io.BytesIO()
+          with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
+              z.writestr("sunrise-mod.toml",'''id="relink_probe"
+          name="Relink Probe"
+          version="0.1.0"
+          api="0.2"
+          side="client"
+          [native]
+          game="26.3"
+          sunrise="cac7bf64590fb38b4badee90f1f09848ce7f8daa"
+          ''')
+              z.writestr("Cargo.toml",'''[package]
+          name="relink_probe"
+          version="0.1.0"
+          edition="2024"
+          [dependencies]
+          sunrise-mod-api={path=".sunrise/sdk/api/crates/sunrise-mod-api"}
+          ''')
+              z.writestr("src/lib.rs",'''use mod_api::{Hooks, ClientHost, RenderPlayerPostEvent};
+          #[derive(Default)]
+          struct Probe;
+          #[mod_api::sunrise_mod]
+          impl Hooks for Probe {
+              fn render_player_post(&self, _: &dyn ClientHost, e: &mut RenderPlayerPostEvent<'_>) {
+                  if e.who.local {
+                      e.draw.quad("block/white_concrete", [[-0.24,1.5,-0.24],[-0.3,0.45,-0.35],[0.3,0.45,-0.35],[0.24,1.5,-0.24]], [0.0,0.0,16.0,16.0], 0xffffff);
+                  }
+              }
+          }
+          ''')
+          raw=out.getvalue()
+          pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
+          PY
+      - name: Configure compact profile without modifying APK or engine code
+        env:
+          CANDIDATE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,pathlib,tomllib
+          root=pathlib.Path.home()/"store/source"
+          manifest=root/"Cargo.toml"
+          source=manifest.read_text()
+          profile=tomllib.loads(source)["profile"]["fast"]
+          print("Original fast profile:",profile)
+          mode=os.environ["CANDIDATE"]
+          if mode in ("size-s","size-z"):
+              opt=mode[-1]
+              for folder in ("control-scripts","baseline-scripts"):
+                  p=pathlib.Path(folder)/"preview4_whole_build.py"
+                  s=p.read_text()
+                  anchor='    env["CARGO_NET_OFFLINE"] = "true"'
+                  assert s.count(anchor)==1
+                  p.write_text(s.replace(anchor,anchor+'\n    env["CARGO_PROFILE_FAST_OPT_LEVEL"] = "'+opt+'"\n    env["CARGO_PROFILE_FAST_LTO"] = "false"'))
+          else:
+              raise RuntimeError(mode)
+          PY
+          python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py
+      - name: Warm trusted candidate profile once
+        env:
+          CANDIDATE: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          scripts="$GITHUB_WORKSPACE/scripts"
+          source "$scripts/preview4_jobs.sh"
+          jobs=$(preview4_jobs)
+          test ! -e "$HOME/.cargo"
+          mv "$HOME/store/cargo" "$HOME/.cargo"
+          cd "$HOME/store/source"
+          extra=()
+          case "$CANDIDATE" in
+            size-s|size-z) extra=(CARGO_PROFILE_FAST_OPT_LEVEL="${CANDIDATE##*-}" CARGO_PROFILE_FAST_LTO=false);;
+            *) exit 1;;
+          esac
+          env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8 \
+            ANDROID_HOME="$HOME/android" ANDROID_NDK_HOME="$HOME/android/ndk/27.3.13750724" \
+            SUNRISE_GAME_BUILD_ID=cac7bf64590fb38b4badee90f1f09848ce7f8daa CARGO_BUILD_JOBS="$jobs" \
+            CARGO_NET_OFFLINE=true "${extra[@]}" \
+            python3 packaging/android/build_apk.py --abi arm64-v8a --profile fast --library-only \
+            >"$GITHUB_WORKSPACE/warm.log" 2>&1 || { tail -100 "$GITHUB_WORKSPACE/warm.log"; exit 1; }
+          tail -25 "$GITHUB_WORKSPACE/warm.log"
+          mv "$HOME/.cargo" "$HOME/store/cargo"
+      - name: No-mod control with warmed compact cache
+        run: |
+          bash control-scripts/preview4_whole_sandbox.sh probe.bin control >control.log 2>&1 || { tail -100 control.log; exit 1; }
+          grep -Ei 'Dirty|Compiling |Cargo build elapsed' control.log | tail -80 || true
+      - name: Mod on warmed compact cache
+        env:
+          SANDBOX_SECONDS: '6600'
+        run: |
+          bash baseline-scripts/preview4_whole_sandbox.sh probe.bin baseline >baseline.log 2>&1 || { tail -100 baseline.log; exit 1; }
+          grep -Ei 'Dirty|Compiling |Cargo build elapsed' baseline.log | tail -80 || true
+      - name: Validate ELF and compare with verified fast V1
+        env:
+          CANDIDATE: ${{ matrix.profile }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess
+          ndk=pathlib.Path.home()/"android/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          def run(tool,*args):
+              return subprocess.check_output([str(ndk/tool),*map(str,args)],text=True)
+          def inspect(name):
+              root=pathlib.Path(name)
+              st=json.loads((root/"status.json").read_text())
+              assert st["state"]=="done",st
+              so=root/"libsunrise_android.so"
+              with so.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==st["sha256"]
+              assert so.stat().st_size==st["size"]
+              header=run("llvm-readelf","-h",so)
+              assert "AArch64" in header and "DYN" in header
+              dyn=run("llvm-readelf","-d",so)
+              exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",so).splitlines())
+              assert "starling_on_create" in exports
+              (root/"sections.txt").write_text(run("llvm-size","-A",so))
+              (root/"segments.txt").write_text(run("llvm-readelf","-lW",so))
+              (root/"dynamic.txt").write_text(dyn)
+              log=pathlib.Path(name+".log").read_text(errors="replace")
+              return {"bytes":so.stat().st_size,"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"compiled_crates":re.findall(r"^\s*Compiling (\S+) v",log,re.M),"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn)),"exports":exports}
+          c,a=inspect("control"),inspect("baseline")
+          expected={"liblog.so","libandroid.so","libdl.so","libaaudio.so","libm.so","libc.so"}
+          report={"profile":os.environ["CANDIDATE"],"control":c,"mod":a,"raw_size_reduction_percent":100*(1-a["bytes"]/116255680),"previous_fast_seconds":3.16,"android_runtime_verified":False}
+          pathlib.Path("compact-warm-report.json").write_text(json.dumps(report,indent=2))
+          print(json.dumps(report))
+          assert c["exports"]==a["exports"]
+          assert set(c["needed"])==set(a["needed"])==expected
+          assert not c["compiled_crates"],c["compiled_crates"]
+          assert set(a["compiled_crates"])=={"smod-relink_probe","sunrise-android"},a["compiled_crates"]
+          assert a["bytes"]<116255680,"No raw size improvement"
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: no-lto-${{ matrix.profile }}
+          path: |
+            warm.log
+            control.log
+            baseline.log
+            control/status.json
+            control/compile-metrics.json
+            control/sections.txt
+            control/segments.txt
+            control/dynamic.txt
+            baseline/status.json
+            baseline/compile-metrics.json
+            baseline/sections.txt
+            baseline/segments.txt
+            baseline/dynamic.txt
+            baseline/cargo-timing.html
+            compact-warm-report.json
+          if-no-files-found: warn
