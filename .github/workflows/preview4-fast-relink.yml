@@ -1,4 +1,4 @@
-name: Preview 4 original APK fast relink
+name: Preview 4 V1 Naga cache freshness
 on:
   pull_request:
     paths:
@@ -11,7 +11,7 @@ concurrency:
   group: preview4-fast-relink-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  benchmark:
+  warm:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -43,12 +43,106 @@ jobs:
             ~/android
             ~/store/source
             ~/store/cargo
-      - name: Prepare one trusted API-only mod and isolated compiler variants
+      - name: Establish one unique newest Naga source before warming
+        run: |
+          set -euo pipefail
+          cd "$HOME/store/source"
+          test "$(git rev-parse HEAD)" = cac7bf64590fb38b4badee90f1f09848ce7f8daa
+          git diff --exit-code HEAD -- third_party/naga
+          python3 - <<'PY'
+          import hashlib, os, pathlib, stat, time
+          root = pathlib.Path("third_party/naga")
+          chosen = root / "build.rs"
+          assert chosen.is_file() and not chosen.is_symlink()
+          files = [p for p in root.rglob("*") if not p.is_symlink() and p.is_file()]
+          assert chosen in files
+          previous = max(p.stat().st_mtime_ns for p in files)
+          # Whole-second unique maximum survives loss of subsecond precision.
+          # Set before compiling; never rewrite Cargo fingerprints or backdate
+          # changed sources. The checkout and source contents remain identical.
+          now = time.time_ns() // 1_000_000_000 * 1_000_000_000
+          if now <= previous:
+              raise RuntimeError("source timestamps not safely older than current time")
+          before = hashlib.sha256(chosen.read_bytes()).hexdigest()
+          os.utime(chosen, ns=(chosen.stat().st_atime_ns, now))
+          assert hashlib.sha256(chosen.read_bytes()).hexdigest() == before
+          assert [p for p in files if p.stat().st_mtime_ns == now] == [chosen]
+          print("Naga unique newest file:", chosen, now, "old maximum:", previous)
+          PY
+          git diff --exit-code HEAD -- third_party/naga
+      - name: Rewarm only the trusted source (no request mods)
+        run: |
+          set -euo pipefail
+          scripts="$GITHUB_WORKSPACE/scripts"
+          source "$scripts/preview4_jobs.sh"
+          jobs=$(preview4_jobs)
+          test ! -e "$HOME/.cargo"
+          mv "$HOME/store/cargo" "$HOME/.cargo"
+          cd "$HOME/store/source"
+          python3 -I "$scripts/preview4_whole_build.py" --prepare-base
+          env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8 \
+            ANDROID_HOME="$HOME/android" ANDROID_NDK_HOME="$HOME/android/ndk/27.3.13750724" \
+            SUNRISE_GAME_BUILD_ID=cac7bf64590fb38b4badee90f1f09848ce7f8daa CARGO_BUILD_JOBS="$jobs" \
+            CARGO_NET_OFFLINE=true CARGO_LOG=cargo::compiler::fingerprint=info \
+            python3 packaging/android/build_apk.py --abi arm64-v8a --profile fast --library-only \
+            >"$GITHUB_WORKSPACE/warm.log" 2>&1 || { tail -100 "$GITHUB_WORKSPACE/warm.log"; exit 1; }
+          grep -Ei 'Dirty|Compiling |Finished' "$GITHUB_WORKSPACE/warm.log" | tail -100 || true
+          mv "$HOME/.cargo" "$HOME/store/cargo"
+          git diff --exit-code HEAD -- third_party/naga
+      - uses: actions/cache/save@v4
+        with:
+          key: preview4-v1-naga-freshness-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: naga-trusted-warm-log
+          path: warm.log
+          if-no-files-found: warn
+  benchmark:
+    needs: warm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Make room
+        run: |
+          rm -rf "$HOME/.rustup" "$HOME/.cargo"
+          bash scripts/room.sh
+      - name: Restore experimental warmed base on a different runner
+        uses: actions/cache/restore@v4
+        with:
+          key: preview4-v1-naga-freshness-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: Verify unique timestamp survived cache archive and restore
+        run: |
+          cd "$HOME/store/source"
+          git diff --exit-code HEAD -- third_party/naga
+          python3 - <<'PY'
+          import pathlib
+          root = pathlib.Path("third_party/naga")
+          files = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()]
+          latest = max(p.stat().st_mtime_ns for p in files)
+          winners = [p for p in files if p.stat().st_mtime_ns == latest]
+          print("Restored newest Naga files:", winners, latest)
+          assert winners == [root / "build.rs"], winners
+          PY
+      - name: Prepare trusted API-only probe and controls
         run: |
           python3 scripts/preview4_relink_experiment.py scripts control-scripts --cache-control
           python3 scripts/preview4_relink_experiment.py scripts baseline-scripts
-          python3 scripts/preview4_relink_experiment.py scripts relink-scripts --link-only
-          python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py relink-scripts/preview4_whole_build.py
+          python3 -m py_compile control-scripts/preview4_whole_build.py baseline-scripts/preview4_whole_build.py
           python3 - <<'PY'
           import io, pathlib, zipfile
           out=io.BytesIO()
@@ -84,22 +178,17 @@ jobs:
           raw=out.getvalue()
           pathlib.Path("probe.bin").write_bytes(len(raw).to_bytes(4,"big")+raw)
           PY
-      - name: No-mod control of restored trusted base
+      - name: No-mod control in original isolated sandbox
         run: |
           set -o pipefail
           bash control-scripts/preview4_whole_sandbox.sh probe.bin control >control.log 2>&1 || { tail -100 control.log; exit 1; }
           grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' control.log | tail -100 || true
-      - name: Baseline v1 with Cargo invalidation diagnostics
+      - name: V1 mod with unchanged linker and original sandbox
         run: |
           set -o pipefail
           bash baseline-scripts/preview4_whole_sandbox.sh probe.bin baseline >baseline.log 2>&1 || { tail -100 baseline.log; exit 1; }
           grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' baseline.log | tail -100 || true
-      - name: Final-link-only v1 with identical cached inputs
-        run: |
-          set -o pipefail
-          bash relink-scripts/preview4_whole_sandbox.sh probe.bin relink >relink.log 2>&1 || { tail -100 relink.log; exit 1; }
-          grep -Ei 'Dirty|Compiling |fingerprint error|stale|Cargo build elapsed' relink.log | tail -100 || true
-      - name: Measure raw downloadable ELF and cache invalidations
+      - name: Measure cache reuse and validate V1 ELF
         run: |
           python3 - <<'PY'
           import hashlib,json,os,pathlib,re,subprocess
@@ -120,44 +209,48 @@ jobs:
               exports=sorted(run("llvm-nm","-D","--defined-only","--format=just-symbols",so).splitlines())
               assert "starling_on_create" in exports
               log=pathlib.Path(name+".log").read_text(errors="replace")
-              dirty=[x for x in log.splitlines() if re.search(r"\bdirty\b|stale|fingerprint error|fingerprint.*changed|missing fingerprint", x, re.I)]
+              dirty=[x for x in log.splitlines() if re.search(r"\bdirty\b|stale|fingerprint error|fingerprint.*changed",x,re.I)]
               (root/"fingerprint-reasons.txt").write_text("\n".join(dirty))
               (root/"dynamic.txt").write_text(dyn)
+              (root/"exports.txt").write_text("\n".join(exports))
               (root/"sections.txt").write_text(run("llvm-size","-A",so))
-              return {"bytes":so.stat().st_size,"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"compiled_crates":re.findall(r"^\s*Compiling (\S+) v",log,re.M),"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn)),"exports":exports,"android_packed_relocations":"ANDROID_RELA" in dyn}
-          c,a,b=inspect("control"),inspect("baseline"),inspect("relink")
-          report={"no_mod_control":c,"baseline":a,"relink":b,"size_reduction_percent":100*(1-b["bytes"]/a["bytes"]),"time_reduction_percent":100*(1-b["seconds"]/a["seconds"]),"android_runtime_verified":False}
-          pathlib.Path("relink-report.json").write_text(json.dumps(report,indent=2))
-          assert a["exports"]==b["exports"],"JNI exports differ"
-          assert a["needed"]==b["needed"],"system dependencies differ"
-          summary=f'Original v1: {a["bytes"]/1e6:.2f} MB, {a["seconds"]:.2f} s, {len(a["compiled_crates"])} crates; final-link candidate: {b["bytes"]/1e6:.2f} MB, {b["seconds"]:.2f} s, {len(b["compiled_crates"])} crates. Android runtime not tested.'
+              return {"bytes":so.stat().st_size,"seconds":json.loads((root/"compile-metrics.json").read_text())["cargo_seconds"],"compiled_crates":re.findall(r"^\s*Compiling (\S+) v",log,re.M),"needed":sorted(re.findall(r"Shared library: \[([^\]]+)\]",dyn)),"exports":exports,"sha256":st["sha256"]}
+          c,a=inspect("control"),inspect("baseline")
+          expected={"liblog.so","libandroid.so","libdl.so","libaaudio.so","libm.so","libc.so"}
+          unexpected_control=set(c["compiled_crates"])
+          unexpected_mod=set(a["compiled_crates"])-{"smod-relink_probe","sunrise-android"}
+          report={"previous_no_mod_seconds":680.676,"previous_mod_seconds":634.782,"control":c,"mod":a,"control_unexpected":sorted(unexpected_control),"mod_unexpected":sorted(unexpected_mod),"mod_time_reduction_percent":100*(1-a["seconds"]/634.782),"android_runtime_verified":False}
+          pathlib.Path("freshness-report.json").write_text(json.dumps(report,indent=2))
+          summary=f'Control: {c["seconds"]:.2f}s, {c["compiled_crates"]}; V1 mod: {a["seconds"]:.2f}s, {a["compiled_crates"]}, {a["bytes"]/1e6:.2f} MB; reduction: {report["mod_time_reduction_percent"]:.2f}%. Android runtime not tested.'
           print(summary)
-          print(f'No-mod control: {c["seconds"]:.2f} s; {len(c["compiled_crates"])} crates: {c["compiled_crates"]}')
-          print("Only with mod:", sorted(set(a["compiled_crates"])-set(c["compiled_crates"])))
+          print("Unexpected rebuilt crates:",sorted(unexpected_control),sorted(unexpected_mod))
           with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write(summary+"\n")
+          assert c["exports"]==a["exports"],"export mismatch"
+          assert set(c["needed"])==set(a["needed"])==expected,"unexpected system libraries"
+          assert not unexpected_control,"no-mod cache is not fresh"
+          assert not unexpected_mod,"unexpected game crate rebuild"
+          assert {"smod-relink_probe","sunrise-android"} <= set(a["compiled_crates"]),"probe or final JNI library was not compiled"
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: original-apk-fast-relink-evidence
+          name: naga-freshness-evidence
           path: |
             control.log
+            baseline.log
             control/status.json
             control/compile-metrics.json
             control/fingerprint-reasons.txt
-            control/sections.txt
+            control/cargo-timing.html
+            control/exports.txt
             control/dynamic.txt
-            baseline.log
-            relink.log
+            control/sections.txt
             baseline/status.json
             baseline/compile-metrics.json
             baseline/fingerprint-reasons.txt
-            baseline/sections.txt
+            baseline/cargo-timing.html
+            baseline/exports.txt
             baseline/dynamic.txt
-            relink/status.json
-            relink/compile-metrics.json
-            relink/fingerprint-reasons.txt
-            relink/sections.txt
-            relink/dynamic.txt
-            relink-report.json
+            baseline/sections.txt
+            freshness-report.json
           if-no-files-found: warn
