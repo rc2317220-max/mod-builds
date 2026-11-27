@@ -88,6 +88,11 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
     REPO = repoOf(env);
     try {
+      // Discovery is read-only: a custom client uses the same repository for
+      // build planning, polling, and downloads. A listed SDK is still required.
+      if (request.method === "GET" && url.pathname === "/v2/capabilities") {
+        return answer(200, { schema: 1, repo: REPO, protocols: ["v1", "v2"] });
+      }
       if (request.method === "POST" && url.pathname === "/v1/build") {
         return await build(request, url, env, ctx);
       }
